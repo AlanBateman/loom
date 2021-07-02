@@ -130,6 +130,8 @@ module java.base {
     exports javax.security.auth.x500;
     exports javax.security.cert;
 
+    // tmp
+    exports jdk.concurrent;
 
     // additional qualified exports may be inserted at build time
     // see make/gensrc/GenModuleInfo.gmk
