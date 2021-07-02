@@ -34,7 +34,6 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 import jdk.concurrent.Thing;
 import jdk.concurrent.TaskThing;
-import jdk.concurrent.DeadlineExpiredException;
 import static jdk.concurrent.TaskThing.Status.*;
 
 import org.testng.annotations.AfterClass;
@@ -364,6 +363,128 @@ public class ThingTest {
             TaskThing<Void> task = thing.fork(SLEEP_FOR_A_DAY);
             assertTrue(thing.cancelRemaining() == thing);
             assertTrue(task.status() == CANCELLED);
+        }
+    }
+
+    /**
+     * Basic tests of completions.
+     */
+    @Test(dataProvider = "factories")
+    public void testCompletions1(ThreadFactory factory) {
+        try (Thing<String> thing = Thing.of(factory)) {
+            TaskThing<String> task1 = thing.fork(() -> "foo");
+            TaskThing<String> task2 = thing.fork(() -> "bar");
+
+            Set<String> results = new HashSet<>();
+            for (var task : thing.completions()) {
+                assertTrue(task.status() == SUCCESS);
+                results.add(task.result());
+            }
+            assertEquals(results, Set.of("foo", "bar"));
+        }
+    }
+
+    /**
+     * Test mix of tasks that complete normally, with exception, and cancel.
+     */
+    @Test(dataProvider = "factories")
+    public void testCompletions2(ThreadFactory factory) {
+        class BarException extends RuntimeException { }
+        try (Thing<String> thing = Thing.of(factory)) {
+            TaskThing<String> task1 = thing.fork(() -> "foo");
+            TaskThing<String> task2 = thing.fork(() -> {
+                throw new BarException();
+            });
+            TaskThing<String> task3 = thing.fork(() -> {
+                Thread.sleep(Duration.ofDays(1));
+                return null;
+            });
+            task3.asFuture().cancel(true);
+
+            for (var task : thing.completions()) {
+                if (task == task1) {
+                    assertTrue(task1.status() == SUCCESS);
+                    assertEquals(task1.result(), "foo");
+                } else if (task == task2) {
+                    assertTrue(task2.status() == FAILURE);
+                    assertTrue(task2.exception() instanceof BarException);
+                } else if (task == task3) {
+                    assertTrue(task3.status() == CANCELLED);
+                    assertTrue(task3.exception() instanceof CancellationException);
+                } else {
+                    assertTrue(false);
+                }
+            }
+        }
+    }
+
+    /**
+     * Test invoking fork during iteration.
+     */
+    @Test(dataProvider = "factories")
+    public void testCompletions3(ThreadFactory factory) {
+        try (Thing<String> thing = Thing.of(factory)) {
+            TaskThing<String> task1 = thing.fork(() -> "foo");
+            Set<String> results = new HashSet<>();
+            for (var task : thing.completions()) {
+                if (task == task1) {
+                    thing.fork(() -> "bar");
+                }
+                results.add(task.result());
+            }
+            assertEquals(results, Set.of("foo", "bar"));
+        }
+    }
+
+    /**
+     * Test two iterators.
+     */
+    @Test(dataProvider = "factories")
+    public void testCompletions4(ThreadFactory factory) {
+        try (Thing<String> thing = Thing.of(factory)) {
+            TaskThing<String> task1 = thing.fork(() -> "foo");
+            var iterator1 = thing.completions().iterator();
+            assertTrue(iterator1.next() == task1);
+            assertFalse(iterator1.hasNext());
+
+            TaskThing<String> task2 = thing.fork(() -> "bar");
+            var iterator2 = thing.completions().iterator();
+            assertTrue(iterator2.next() == task2);
+            assertFalse(iterator2.hasNext());
+        }
+    }
+
+    /**
+     * Test invoking iterator methods with interrupt status set.
+     */
+    @Test(dataProvider = "factories")
+    public void testCompletions5(ThreadFactory factory) {
+        try (Thing<Void> thing = Thing.of(factory)) {
+            TaskThing<Void> task = thing.fork(SLEEP_FOR_A_DAY);
+            var iterator = thing.completions().iterator();
+            Thread.currentThread().interrupt();
+            assertTrue(iterator.next() == task);
+            assertTrue(task.status() == CANCELLED);
+            assertTrue(Thread.currentThread().isInterrupted());
+        } finally {
+            Thread.interrupted();  // clear interrupt status
+        }
+    }
+
+    /**
+     * Test interrupting thread waiting in iterator
+     */
+    @Test(dataProvider = "factories")
+    public void testCompletions6(ThreadFactory factory) {
+        try (Thing<Void> thing = Thing.of(factory)) {
+            TaskThing<Void> task = thing.fork(SLEEP_FOR_A_DAY);
+            var iterator = thing.completions().iterator();
+            scheduleInterrupt(Thread.currentThread(), Duration.ofMillis(500));
+            assertTrue(iterator.next() == task);
+            assertTrue(task.status() == CANCELLED);
+            assertTrue(Thread.currentThread().isInterrupted());
+        } finally {
+            Thread.interrupted();  // clear interrupt status
         }
     }
 
