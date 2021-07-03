@@ -66,13 +66,13 @@ final class ThingImpl<T> implements Thing<T>, ThreadContainer {
     private int tasksStarted;
 
     // completed tasks
-    private LinkedTransferQueue<TaskThing<T>> queue = new LinkedTransferQueue<>();
+    private BlockingQueue<TaskThing<T>> queue = new LinkedTransferQueue<>();
 
     // number of tasks taken from queue
     private int taken;
 
     // deadline support
-    private volatile Future<?> timerTask;
+    private Future<?> timerTask;
     private volatile boolean deadlineExpired;  // set to true if deadline expired
     private final Object closeLock = new Object();
 
@@ -250,7 +250,7 @@ final class ThingImpl<T> implements Thing<T>, ThreadContainer {
         // Add dependent task to queue task when completed. This ensures the
         // task is queued promptly when cancelled. This is important for tasks
         // that do not respond to interrupt as they may not terminate.
-        LinkedTransferQueue<TaskThing<T>> q = this.queue;
+        BlockingQueue<TaskThing<T>> q = this.queue;
         if (queue != null) {
             future.handle((r, e) -> {
                 q.add(future);
