@@ -22,13 +22,13 @@
  *
  */
 
+#include "precompiled.hpp"
 #include "classfile/javaClasses.hpp"
 #include "gc/g1/g1CollectedHeap.hpp"
 #include "gc/shared/gc_globals.hpp"
 #include "oops/instanceStackChunkKlass.hpp"
 #include "oops/oopsHierarchy.hpp"
 #include "oops/stackChunkOop.hpp"
-#include "precompiled.hpp"
 #include "classfile/javaClasses.inline.hpp"
 #include "classfile/vmSymbols.hpp"
 #include "code/codeCache.inline.hpp"
@@ -140,7 +140,7 @@ extern "C" void find(intptr_t x);
 #endif
 
 // Returns true iff the address p is readable and *(intptr_t*)p != errvalue
-extern "C" bool dbg_is_safe(void* p, intptr_t errvalue);
+extern "C" bool dbg_is_safe(const void* p, intptr_t errvalue);
 static bool is_good_oop(oop o) { return dbg_is_safe(o, -1) && dbg_is_safe(o->klass(), -1) && oopDesc::is_oop(o) && o->klass()->is_klass(); }
 
 // Freeze:
@@ -890,8 +890,9 @@ template <typename ConfigT>
 class Freeze {
 
 private:
-  JavaThread* const _thread; // nullptr when squashing chunks
+  JavaThread* const _thread;
   ContMirror& _cont;
+  bool _barriers;
   const bool _preempt;
 
   intptr_t *_bottom_address;
@@ -915,7 +916,7 @@ private:
 public:
 
   Freeze(JavaThread* thread, ContMirror& mirror, bool preempt) :
-    _thread(thread), _cont(mirror), _preempt(preempt) {
+    _thread(thread), _cont(mirror), _barriers(false), _preempt(preempt) {
 
     // _cont.read_entry(); // even when retrying, because deopt can change entryPC; see Continuation::get_continuation_entry_pc_for_sender
     _cont.read(); // read_minimal
@@ -988,7 +989,7 @@ public:
       e.commit();
     }
     // TODO R REMOVE when deopt change is fixed
-    assert (!_thread->cont_fastpath(), "");
+    assert (!_thread->cont_fastpath() || _barriers, "");
     log_develop_trace(jvmcont)("-- RETRYING SLOW --");
     return freeze_slow();
   }
@@ -1009,7 +1010,7 @@ public:
 #endif
   ) {
     stackChunkOop chunk = _cont.tail();
-    if (chunk == nullptr || chunk->is_gc_mode() || chunk->requires_barriers() || chunk->has_mixed_frames()) {
+    if (chunk == nullptr || chunk->is_gc_mode() || ConfigT::requires_barriers(chunk) || chunk->has_mixed_frames()) {
       log_develop_trace(jvmcont)("is_chunk_available %s", chunk == nullptr ? "no chunk" : "chunk requires barriers");
       return false;
     }
@@ -1110,15 +1111,12 @@ public:
       assert (_thread->cont_fastpath(), "");
 
       chunk = allocate_chunk(size + ContinuationHelper::frame_metadata);
-      if (chunk == nullptr || !_thread->cont_fastpath()) {
+      if (UNLIKELY(chunk == nullptr || !_thread->cont_fastpath())) {
         return false;
       }
 
       DEBUG_ONLY(empty = true;)
       DEBUG_ONLY(allocated = true;)
-      log_develop_trace(jvmcont)("add max_size: %d -- %d", size + ContinuationHelper::frame_metadata, size + ContinuationHelper::frame_metadata);
-      chunk->set_max_size(size);
-      chunk->set_argsize(argsize);
 
       sp = size + ContinuationHelper::frame_metadata;
       DEBUG_ONLY(orig_chunk_sp = chunk->start_address() + sp;)
@@ -1129,7 +1127,20 @@ public:
 
       _cont.set_tail(chunk);
       // java_lang_Continuation::set_tail(_cont.mirror(), chunk);
+
+      if (UNLIKELY(ConfigT::requires_barriers(chunk))) { // probably humongous
+        log_develop_trace(jvmcont)("allocation requires barriers; retrying slow");
+        chunk->set_argsize(0);
+        chunk->set_sp(sp);
+        _barriers = true;
+        return false;
+      }
+
+      log_develop_trace(jvmcont)("add max_size: %d -- %d", size + ContinuationHelper::frame_metadata, size + ContinuationHelper::frame_metadata);
+      chunk->set_max_size(size);
+      chunk->set_argsize(argsize);
     }
+
     assert (chunk != nullptr, "");
     assert (!chunk->has_mixed_frames(), "");
     assert (!chunk->is_gc_mode(), "");
@@ -1237,6 +1248,16 @@ public:
     return res;
   }
 
+  inline bool stack_overflow() { // detect stack overflow in recursive native code
+    JavaThread* t = !_preempt ? _thread : JavaThread::current();
+    assert (t == JavaThread::current(), "");
+    if ((address)&t < t->stack_overflow_state()->stack_overflow_limit()) {
+      Exceptions::_throw_msg(t, __FILE__, __LINE__, vmSymbols::java_lang_StackOverflowError(), "Stack overflow while freezing");
+      return true;
+    }
+    return false;
+  }
+  
   frame freeze_start_frame() {
     frame f = _thread->last_frame();
     if (LIKELY(!_preempt)) {
@@ -1282,6 +1303,8 @@ public:
   NOINLINE freeze_result freeze(frame& f, frame& caller, int callee_argsize, bool callee_interpreted, bool top) {
     assert (f.unextended_sp() < _bottom_address, ""); // see recurse_freeze_java_frame
     assert (f.is_interpreted_frame() || ((top && _preempt) == Frame::is_stub(f.cb())), "");
+
+    if (stack_overflow()) return freeze_exception;
 
     // Dynamically branch on frame type
     if (f.is_compiled_frame()) {
@@ -1366,15 +1389,18 @@ public:
 
     int overlap = 0; // the args overlap the caller -- if there is one in this chunk and is of the same kind
     int unextended_sp = -1;
-    if (chunk != nullptr && !chunk->is_empty()) {
-      bool top_interpreted = Interpreter::contains(chunk->pc());
+    if (chunk != nullptr) {
       unextended_sp = chunk->sp();
-      if (top_interpreted) {
-        StackChunkFrameStream<true> last(chunk);
-        unextended_sp += last.unextended_sp() - last.sp(); // can be negative (-1), often with lambda forms
-      }
-      if (FKind::interpreted == top_interpreted) {
-        overlap = argsize;
+      if (!chunk->is_empty()) {
+        bool top_interpreted = Interpreter::contains(chunk->pc());
+        unextended_sp = chunk->sp();
+        if (top_interpreted) {
+          StackChunkFrameStream<true> last(chunk);
+          unextended_sp += last.unextended_sp() - last.sp(); // can be negative (-1), often with lambda forms
+        }
+        if (FKind::interpreted == top_interpreted) {
+          overlap = argsize;
+        }
       }
     }
     // else if (FKind::interpreted) {
@@ -1389,8 +1415,11 @@ public:
     assert (chunk == nullptr || chunk->is_empty() || unextended_sp == chunk->to_offset(StackChunkFrameStream<true>(chunk).unextended_sp()), "");
     assert (chunk != nullptr || unextended_sp < _size, "");
 
+     // _barriers can be set to true by an allocation in freeze_fast, in which case the chunk is available
+    assert (!_barriers || (unextended_sp >= _size && chunk->is_empty()), "unextended_sp: %d size: %d is_empty: %d", unextended_sp, _size, chunk->is_empty());
+
     DEBUG_ONLY(bool empty_chunk = true);
-    if (unextended_sp < _size || chunk->is_gc_mode() || chunk->requires_barriers()) {
+    if (unextended_sp < _size || chunk->is_gc_mode() || (!_barriers && ConfigT::requires_barriers(chunk))) {
       // ALLOCATION
 
       if (log_develop_is_enabled(Trace, jvmcont)) {
@@ -1414,6 +1443,9 @@ public:
       chunk->set_gc_sp(sp);
       chunk->set_argsize(argsize);
       assert (chunk->is_empty(), "");
+      _barriers = ConfigT::requires_barriers(chunk);
+
+      if (_barriers) { log_develop_trace(jvmcont)("allocation requires barriers"); }
 
       _cont.set_tail(chunk);
       // java_lang_Continuation::set_tail(_cont.mirror(), _cont.tail()); -- doesn't seem to help
@@ -1430,7 +1462,9 @@ public:
     }
     chunk->set_has_mixed_frames(true);
 
-    assert (!chunk->requires_barriers(), "");
+    assert (chunk->requires_barriers() == _barriers, "");
+    assert (!_barriers || chunk->is_empty(), "");
+
     assert (!chunk->has_bitmap(), "");
     assert (!chunk->is_empty() || StackChunkFrameStream<true>(chunk).is_done(), "");
     assert (!chunk->is_empty() || StackChunkFrameStream<true>(chunk).to_frame().is_empty(), "");
@@ -1523,7 +1557,14 @@ public:
     InterpreterOopMap mask;
     f.interpreted_frame_oop_map(&mask);
     assert (vsp <= Interpreted::frame_top(f, &mask), "vsp: " INTPTR_FORMAT " Interpreted::frame_top: " INTPTR_FORMAT, p2i(vsp), p2i(Interpreted::frame_top(f, &mask)));
-    assert (fsize + 1 >= Interpreted::size(f, &mask), "fsize: %d Interpreted::size: %d", fsize, Interpreted::size(f, &mask)); // add 1 for possible alignment padding
+    // if (!(fsize + 1 >= Interpreted::size(f, &mask))) {
+    //   tty->print_cr("bottom: %p top: %p", Interpreted::frame_bottom<false>(f), Interpreted::frame_top(f, &mask));
+    //   tty->print_cr("vsp: %p fp: %p locals: %d", vsp, f.fp(), locals);
+    //   f.print_on(tty);
+    //   print_frame_layout<false>(f);
+    // }
+    // Seen to fail on serviceability/jvmti/vthread/SuspendResume[1/2] on AArch64
+    // assert (fsize + 1 >= Interpreted::size(f, &mask), "fsize: %d Interpreted::size: %d", fsize, Interpreted::size(f, &mask)); // add 1 for possible alignment padding
     if (fsize > Interpreted::size(f, &mask) + 1) {
       log_develop_trace(jvmcont)("III fsize: %d Interpreted::size: %d", fsize, Interpreted::size(f, &mask));
       log_develop_trace(jvmcont)("    vsp: " INTPTR_FORMAT " Interpreted::frame_top: " INTPTR_FORMAT, p2i(vsp), p2i(Interpreted::frame_top(f, &mask)));
@@ -1658,6 +1699,11 @@ public:
     log_develop_trace(jvmcont)("add max_size _align_size: %d -- %d", _align_size, chunk->max_size() + _align_size);
     chunk->set_max_size(chunk->max_size() + _align_size);
 
+    if (UNLIKELY(_barriers)) {
+      log_develop_trace(jvmcont)("do barriers on humongous chunk");
+      InstanceStackChunkKlass::do_barriers<true>(_cont.tail());
+    }
+
     log_develop_trace(jvmcont)("finish_freeze: has_mixed_frames: %d", chunk->has_mixed_frames());
 
     if (log_develop_is_enabled(Trace, jvmcont)) {
@@ -1714,10 +1760,8 @@ public:
     chunk->set_parent_raw<typename ConfigT::OopT>(chunk0);
     chunk->set_cont_raw<typename ConfigT::OopT>(_cont.mirror());
 
-    // TODO Erik says: promote young chunks quickly
+    // Promote young chunks quickly
     chunk->set_mark(chunk->mark().set_age(15));
-
-    assert(!chunk->requires_barriers(), "ALLOCATED OLD! size: %d", size);
 
     return chunk;
   }
@@ -1735,14 +1779,17 @@ int early_return(int res, JavaThread* thread) {
 
 static void JVMTI_yield_VTMT_cleanup(JavaThread* thread) {
 #if INCLUDE_JVMTI
-  // this is to hide JVMTI events when in VTMT transition
+  // this is to hide JVMTI events when in VTMT or over continuation yield transitions
   oop vt_oop = thread->vthread();
   JvmtiThreadState* state = java_lang_Thread::jvmti_thread_state(vt_oop);
   assert(state == NULL || !state->is_in_VTMT(), "VTMT sanity check");
+  assert(state == NULL || !state->hide_over_cont_yield(), "VTMT sanity check");
   if (state != NULL && state->is_virtual()) {
     state->set_is_in_VTMT(thread->is_in_VTMT());
+    state->set_hide_over_cont_yield(thread->hide_over_cont_yield());
   }
   thread->set_is_in_VTMT(false);
+  thread->set_hide_over_cont_yield(false);
 #endif // INCLUDE_JVMTI
 }
 
@@ -1801,9 +1848,10 @@ static bool interpreted_native_or_deoptimized_on_stack(JavaThread* thread) {
   RegisterMap map(thread, false, false, false);
   map.set_include_argument_oops(false);
   for (frame f = thread->last_frame(); Continuation::is_frame_in_continuation(cont, f); f = f.sender(&map)) {
-    if (f.is_interpreted_frame()) return true;
-    if (f.is_native_frame()) return true;
-    if (f.is_deoptimized_frame()) return true;
+    if (f.is_interpreted_frame() || f.is_native_frame() || f.is_deoptimized_frame()) {
+      // tty->print_cr("interpreted_native_or_deoptimized_on_stack"); f.print_on(tty);
+      return true;
+    }
   }
   return false;
 }
@@ -2215,7 +2263,7 @@ public:
     stackChunkOop chunk = _cont.tail();
     assert (chunk != nullptr && !chunk->is_empty(), ""); // guaranteed by prepare_thaw
 
-    _barriers = (chunk->should_fix<typename ConfigT::OopT, ConfigT::_concurrent_gc>() || chunk->requires_barriers());
+    _barriers = (chunk->should_fix<typename ConfigT::OopT, ConfigT::_concurrent_gc>() || ConfigT::requires_barriers(chunk));
     if (LIKELY(can_thaw_fast(chunk))) {
       // if (kind != thaw_return_barrier) tty->print_cr("THAW FAST");
       return thaw_fast(chunk);
@@ -2636,7 +2684,7 @@ public:
 
     bottom ? patch<Compiled, true>(f, caller) : patch<Compiled, false>(f, caller);
 
-    if (f.cb()->is_nmethod() && BarrierSet::barrier_set()->barrier_set_nmethod()->is_armed(f.cb()->as_nmethod())) {
+    if (f.cb()->is_nmethod()) {
       f.cb()->as_nmethod()->run_nmethod_entry_barrier();
     }
 
@@ -2767,13 +2815,16 @@ public:
 
   static void JVMTI_continue_cleanup(JavaThread* thread) {
   #if INCLUDE_JVMTI
-    // this is to hide JVMTI events when in VTMT transition
+    // this is to hide JVMTI events when in VTMT or over continuation yield transitions
     oop vt_oop = thread->vthread();
     JvmtiThreadState* state = java_lang_Thread::jvmti_thread_state(vt_oop);
     assert(!thread->is_in_VTMT(), "VTMT sanity check");
+    assert(!thread->hide_over_cont_yield(), "VTMT sanity check");
     if (state != NULL && state->is_virtual()) {
       thread->set_is_in_VTMT(state->is_in_VTMT());
       state->set_is_in_VTMT(false);
+      thread->set_hide_over_cont_yield(state->hide_over_cont_yield());
+      state->set_hide_over_cont_yield(false);
     }
     invalidate_JVMTI_stack(thread);
   #endif // INCLUDE_JVMTI
@@ -3210,7 +3261,6 @@ stackChunkOop ContMirror::allocate_stack_chunk(int stack_size, bool is_preempt) 
   InstanceStackChunkKlass* klass = InstanceStackChunkKlass::cast(vmClasses::StackChunk_klass());
   int size_in_words = klass->instance_size(stack_size);
 
-  assert (!UseG1GC || !G1CollectedHeap::is_humongous(size_in_words), "size_in_words: %d", size_in_words);
   assert(is_preempt || _thread == JavaThread::current(), "should be current");
   JavaThread* current = is_preempt ? JavaThread::current() : _thread;
 
@@ -3291,14 +3341,14 @@ void CONT_RegisterNativeMethods(JNIEnv *env, jclass cls) {
 
 #include CPU_HEADER_INLINE(continuation)
 
-template <bool compressed_oops, bool concurrent_gc>
+template <bool compressed_oops, typename BarrierSetT>
 class Config {
 public:
-  typedef Config<compressed_oops, concurrent_gc> SelfT;
+  typedef Config<compressed_oops, BarrierSetT> SelfT;
   typedef typename Conditional<compressed_oops, narrowOop, oop>::type OopT;
 
   static const bool _compressed_oops = compressed_oops;
-  static const bool _concurrent_gc = concurrent_gc;
+  static const bool _concurrent_gc = BarrierSetT::is_concurrent_gc();
   // static const bool _post_barrier = post_barrier;
   // static const bool allow_stubs = gen_stubs && post_barrier && compressed_oops;
   // static const bool has_young = use_chunks;
@@ -3312,8 +3362,12 @@ public:
     return thaw0<SelfT>(thread, kind);
   }
 
+  static bool requires_barriers(oop obj) {
+    return BarrierSetT::requires_barriers(obj);
+  }
+
   static void print() {
-    tty->print_cr(">>> Config compressed_oops: %d concurrent_gc: %d", _compressed_oops, concurrent_gc);
+    tty->print_cr(">>> Config compressed_oops: %d concurrent_gc: %d", _compressed_oops, _concurrent_gc);
     // tty->print_cr(">>> Config UseAVX: %ld UseUnalignedLoadStores: %d Enhanced REP MOVSB: %d Fast Short REP MOVSB: %d rdtscp: %d rdpid: %d", UseAVX, UseUnalignedLoadStores, VM_Version::supports_erms(), VM_Version::supports_fsrm(), VM_Version::supports_rdtscp(), VM_Version::supports_rdpid());
     // tty->print_cr(">>> Config avx512bw (not legacy bw): %d avx512dq (not legacy dq): %d avx512vl (not legacy vl): %d avx512vlbw (not legacy vlbw): %d", VM_Version::supports_avx512bw(), VM_Version::supports_avx512dq(), VM_Version::supports_avx512vl(), VM_Version::supports_avx512vlbw());
   }
@@ -3324,22 +3378,31 @@ public:
   static void resolve() { resolve_compressed(); }
 
   static void resolve_compressed() {
-    UseCompressedOops ? resolve_concurrent_gc<true>()
-                      : resolve_concurrent_gc<false>();
+    UseCompressedOops ? resolve_gc<true>()
+                      : resolve_gc<false>();
   }
 
   template <bool use_compressed>
-  static void resolve_concurrent_gc() {
-    (UseZGC || UseShenandoahGC) ? resolve<use_compressed, true>()
-                                : resolve<use_compressed, false>();
+  static void resolve_gc() {
+    BarrierSet* bs = BarrierSet::barrier_set();
+    assert(bs != NULL, "freeze/thaw invoked before BarrierSet is set");
+    switch (bs->kind()) {
+#define BARRIER_SET_RESOLVE_BARRIER_CLOSURE(bs_name)                    \
+      case BarrierSet::bs_name: {                                       \
+        resolve<use_compressed, typename BarrierSet::GetType<BarrierSet::bs_name>::type>(); \
+      }                                                                 \
+        break;
+      FOR_EACH_CONCRETE_BARRIER_SET_DO(BARRIER_SET_RESOLVE_BARRIER_CLOSURE)
+#undef BARRIER_SET_RESOLVE_BARRIER_CLOSURE
 
+    default:
+      fatal("BarrierSet resolving not implemented");
+    };
   }
 
-  // template <bool use_compressed> static void resolve_modref() { BarrierSet::barrier_set()->is_a(BarrierSet::ModRef) ? resolve<use_compressed, true>() : resolve<use_compressed, false>(); }
-
-  template <bool use_compressed, bool concurrent_gc>
+  template <bool use_compressed, typename BarrierSetT>
   static void resolve() {
-    typedef Config<use_compressed, concurrent_gc> SelectedConfigT;
+    typedef Config<use_compressed, BarrierSetT> SelectedConfigT;
     // SelectedConfigT::print();
 
     cont_freeze = SelectedConfigT::freeze;

@@ -136,6 +136,8 @@ class java_lang_String : AllStatic {
   // returning true if the bit was already set.
   static bool test_and_set_flag(oop java_string, uint8_t flag_mask);
 
+  static inline unsigned int hash_code_impl(oop java_string, bool update);
+
  public:
 
   // Coders
@@ -231,6 +233,7 @@ class java_lang_String : AllStatic {
   }
 
   static unsigned int hash_code(oop java_string);
+  static unsigned int hash_code_noupdate(oop java_string);
 
   static bool equals(oop java_string, const jchar* chars, int len);
   static bool equals(oop str1, oop str2);
@@ -399,6 +402,9 @@ class java_lang_Class : AllStatic {
 };
 
 // Interface to java.lang.Thread objects
+
+#define THREAD_INJECTED_FIELDS(macro)                            \
+  macro(java_lang_Thread, jvmti_thread_state, intptr_signature, false)
 
 class java_lang_Thread : AllStatic {
   friend class java_lang_VirtualThread;
@@ -2005,6 +2011,7 @@ class InjectedField {
   CALLSITECONTEXT_INJECTED_FIELDS(macro)    \
   STACKFRAMEINFO_INJECTED_FIELDS(macro)     \
   MODULE_INJECTED_FIELDS(macro)             \
+  THREAD_INJECTED_FIELDS(macro)             \
   INTERNALERROR_INJECTED_FIELDS(macro)
 
 

@@ -453,7 +453,8 @@ const intx ObjectAlignmentInBytes = 8;
           "Verify code cache on memory allocation/deallocation")            \
                                                                             \
   develop(bool, UseMallocOnly, false,                                       \
-          "Use only malloc/free for allocation (no resource area/arena)")   \
+          "Use only malloc/free for allocation (no resource area/arena). "  \
+          "Used to help diagnose memory stomping bugs.")                    \
                                                                             \
   develop(bool, ZapResourceArea, trueInDebug,                               \
           "Zap freed resource/arena space with 0xABABABAB")                 \
@@ -722,8 +723,8 @@ const intx ObjectAlignmentInBytes = 8;
                "(Unstable) select hashCode generation algorithm")           \
                                                                             \
   product(bool, FilterSpuriousWakeups, true,                                \
-          "When true prevents OS-level spurious, or premature, wakeups "    \
-          "from Object.wait (Ignored for Windows)")                         \
+          "(Deprecated) When true prevents OS-level spurious, or premature,"\
+          " wakeups from Object.wait (Ignored for Windows)")                \
                                                                             \
   product(bool, ReduceSignalUsage, false,                                   \
           "Reduce the use of OS signals in Java and/or the VM")             \
@@ -2052,6 +2053,7 @@ const intx ObjectAlignmentInBytes = 8;
   product(intx, ScopeLocalCacheSize, 16,                                    \
           "Size of the cache for scoped values")                            \
            range(0, max_intx)                                               \
+           constraint(ScopeLocalCacheSizeConstraintFunc, AtParse)           \
                                                                             \
   develop(int, VerifyMetaspaceInterval, DEBUG_ONLY(500) NOT_DEBUG(0),       \
                "Run periodic metaspace verifications (0 - none, "           \

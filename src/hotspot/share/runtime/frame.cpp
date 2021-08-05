@@ -1201,9 +1201,7 @@ void frame::oops_do_internal(OopClosure* f, CodeBlobClosure* cf, DerivedOopClosu
   } else if (is_entry_frame()) {
     oops_entry_do(f, map);
   } else if (is_optimized_entry_frame()) {
-   // Nothing to do
-   // receiver is a global ref
-   // handle block is for JNI
+    _cb->as_optimized_entry_blob()->oops_do(f, *this);
   } else if (CodeCache::contains(pc())) {
     oops_code_blob_do(f, cf, df, derived_mode, map);
   } else {
@@ -1292,7 +1290,7 @@ void frame::interpreter_frame_verify_monitor(BasicObjectLock* value) const {
 #ifndef PRODUCT
 
 // Returns true iff the address p is readable and *(intptr_t*)p != errvalue
-extern "C" bool dbg_is_safe(void* p, intptr_t errvalue);
+extern "C" bool dbg_is_safe(const void* p, intptr_t errvalue);
 
 class FrameValuesOopClosure: public OopClosure, public DerivedOopClosure {
 private:

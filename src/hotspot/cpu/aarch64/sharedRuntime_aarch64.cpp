@@ -683,6 +683,10 @@ void SharedRuntime::gen_i2c_adapter(MacroAssembler *masm,
     }
   }
 
+  __ mov(rscratch2, rscratch1);
+  __ push_cont_fastpath(rthread); // Set JavaThread::_cont_fastpath to the sp of the oldest interpreted frame we know about; kills rscratch1
+  __ mov(rscratch1, rscratch2);
+
   // 6243940 We might end up in handle_wrong_method if
   // the callee is deoptimized as we race thru here. If that
   // happens we don't want to take a safepoint because the
@@ -1237,20 +1241,22 @@ static void gen_continuation_enter(MacroAssembler* masm,
 
   //BarrierSetAssembler* bs = BarrierSet::barrier_set()->barrier_set_assembler();
   //bs->nmethod_entry_barrier(masm);
-  OopMap* map = continuation_enter_setup(masm, stack_slots);  // kills rax
+  OopMap* map = continuation_enter_setup(masm, stack_slots);
 
   // Frame is now completed as far as size and linkage.
   frame_complete =__ pc() - start;
 
-  fill_continuation_entry(masm); // kills rax
+  fill_continuation_entry(masm);
 
   __ cmp(c_rarg2, (u1)0);
   __ br(Assembler::NE, call_thaw);
   
   address mark = __ pc();
-  __ relocate(resolve.rspec());
+//  __ relocate(resolve.rspec());
   //if (!far_branches()) {
-  __ bl(resolve.target());
+//  __ bl(resolve.target()); 
+  __ trampoline_call1(resolve, NULL, false);
+
   oop_maps->add_gc_map(__ pc() - start, map);
   __ post_call_nop();
 
@@ -1271,7 +1277,6 @@ static void gen_continuation_enter(MacroAssembler* masm,
   /// exception handling
 
   exception_offset = __ pc() - start;
-
   {
       __ ldr(c_rarg1, Address(rfp, wordSize)); // return address
       __ mov(r19, r0); // save return value contaning the exception oop in callee-saved R19
@@ -1279,14 +1284,15 @@ static void gen_continuation_enter(MacroAssembler* masm,
 
       // see OptoRuntime::generate_exception_blob: r0 -- exception oop, r3 -- exception pc
 
-      __ mov(rscratch2, r0); // the exception handler
+      __ mov(r1, r0); // the exception handler
       __ mov(r0, r19); // restore return value contaning the exception oop
-      __ ldp(rfp, r3, Address(__ post(sp, 2 * wordSize))); 
-      __ br(rscratch2); // the exception handler
-  }
+      __ verify_oop(r0);
 
-  continuation_enter_cleanup(masm);
-  __ stop("not implemented");
+      continuation_enter_cleanup(masm);
+      __ mov(sp, rfp);
+      __ ldp(rfp, r3, Address(__ post(sp, 2 * wordSize))); 
+      __ br(r1); // the exception handler
+  }
 
   CodeBuffer* cbuf = masm->code_section()->outer();
   address stub = CompiledStaticCall::emit_to_interp_stub(*cbuf, mark);

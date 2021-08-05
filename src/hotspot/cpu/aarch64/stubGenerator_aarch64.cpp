@@ -353,6 +353,8 @@ class StubGenerator: public StubCodeGenerator {
     }
 #endif
 
+    __ pop_cont_fastpath(rthread);
+
     // restore callee-save registers
     __ ldpd(v15, v14,  d15_save);
     __ ldpd(v13, v12,  d13_save);
@@ -6220,15 +6222,22 @@ RuntimeStub* generate_cont_doYield() {
 
     if (exception) {
       __ ldr(c_rarg1, Address(rfp, wordSize)); // return address
+      __ verify_oop(r0);
       __ mov(r19, r0); // save return value contaning the exception oop in callee-saved R19
+
       __ call_VM_leaf(CAST_FROM_FN_PTR(address, SharedRuntime::exception_handler_for_return_address), rthread, c_rarg1);
+
+      // Reinitialize the ptrue predicate register, in case the external runtime call clobbers ptrue reg, as we may return to SVE compiled code.
+      // __ reinitialize_ptrue();
 
       // see OptoRuntime::generate_exception_blob: r0 -- exception oop, r3 -- exception pc
 
-      __ mov(rscratch2, r0); // the exception handler
+      __ mov(r1, r0); // the exception handler
       __ mov(r0, r19); // restore return value contaning the exception oop
+      __ verify_oop(r0);
+
       __ ldp(rfp, r3, Address(__ post(sp, 2 * wordSize))); 
-      __ br(rscratch2); // the exception handler
+      __ br(r1); // the exception handler
     }
 
     // We're "returning" into the topmost thawed frame; see Thaw::push_return_frame
@@ -6271,11 +6280,15 @@ RuntimeStub* generate_cont_doYield() {
       // This is necessary for forced yields, as the return addres (in rbx) is captured in a call_VM, and skips the restoration of rbcp and locals
       // see InterpreterMacroAssembler::restore_bcp/restore_locals
 
-      __ mov(rfp, sp);
-      __ leave();
+      assert_asm(_masm, __ cmp(sp, rfp), Assembler::EQ, "sp != fp"); // __ mov(rfp, sp);
+      __ leave(); // we're now on the last thawed frame
 
       __ ldr(rbcp,    Address(rfp, frame::interpreter_frame_bcp_offset    * wordSize));
       __ ldr(rlocals, Address(rfp, frame::interpreter_frame_locals_offset * wordSize));
+
+      // Restore stack bottom in case i2c adjusted stack and NULL it as marker that esp is now tos until next java call
+      __ ldr(esp, Address(rfp, frame::interpreter_frame_last_sp_offset * wordSize));
+      __ str(zr,  Address(rfp, frame::interpreter_frame_last_sp_offset * wordSize));
 
       __ ret(lr);
 

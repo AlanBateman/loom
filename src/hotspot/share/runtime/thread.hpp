@@ -56,7 +56,6 @@
 #include "jfr/support/jfrThreadExtension.hpp"
 #endif
 
-
 class SafeThreadsListPtr;
 class ThreadSafepointState;
 class ThreadsList;
@@ -809,8 +808,8 @@ class JavaThread: public Thread {
     //       when the sign-bit is used, and sometimes incorrectly - see CR 6398077
     _has_async_exception    = 0x00000001U, // there is a pending async exception
     _trace_flag             = 0x00000004U, // call tracing backend
-    _obj_deopt              = 0x00000008U,  // suspend for object reallocation and relocking for JVMTI agent
-    _cthread_pending_suspend = 0x00000010U // carrier thread is suspended while vthread is mounted
+    _obj_deopt              = 0x00000008U, // suspend for object reallocation and relocking for JVMTI agent
+    _thread_suspended       = 0x00000010U  // non-virtual thread is externally suspended
   };
 
   // various suspension related flags - atomically updated
@@ -933,6 +932,8 @@ class JavaThread: public Thread {
                                                          // never locked) when throwing an exception. Used by interpreter only.
   bool                  _is_in_VTMT;             // thread is in virtual thread mount transition
   bool                  _is_VTMT_disabler;       // thread currently disabled VTMT
+  bool                  _hide_over_cont_yield;   // thread is in a mode to hide activity around Continuation.yield
+                                                 // from JVMTI (set at unmount and cleared at mount)
 
   // JNI attach states:
   enum JNIAttachStates {
@@ -1190,6 +1191,8 @@ private:
   void dec_held_monitor_count() { assert (_held_monitor_count > 0, ""); _held_monitor_count--; }
 
  private:
+  DEBUG_ONLY(void verify_frame_info();)
+
   // Support for thread handshake operations
   HandshakeState _handshake;
  public:
@@ -1219,17 +1222,23 @@ private:
   // current thread, i.e. reverts optimizations based on escape analysis.
   void wait_for_object_deoptimization();
 
-  inline void set_cthread_pending_suspend();
-  inline void clear_cthread_pending_suspend();
+  inline void set_thread_suspended();
+  inline void clear_thread_suspended();
  
-  bool is_cthread_pending_suspend() const {
-    return (_suspend_flags & _cthread_pending_suspend) != 0;
+  bool is_thread_suspended() const {
+    return (_suspend_flags & _thread_suspended) != 0;
   }
  
-  bool is_in_VTMT() const                        { return _is_in_VTMT; }
-  void set_is_in_VTMT(bool val)                  { _is_in_VTMT = val; }
   bool is_VTMT_disabler() const                  { return _is_VTMT_disabler; }
-  void set_is_VTMT_disabler(bool val)            { _is_VTMT_disabler = val; }
+  bool is_in_VTMT() const                        { return _is_in_VTMT; }
+  bool hide_over_cont_yield() const              { return _hide_over_cont_yield; }
+  bool disable_jvmti_events() const {
+    return is_in_VTMT() || hide_over_cont_yield();
+  }
+
+  void set_is_in_VTMT(bool val);
+  void set_is_VTMT_disabler(bool val);
+  void set_hide_over_cont_yield(bool val)        { _hide_over_cont_yield = val; }
 
   bool is_cont_force_yield() { return cont_preempt(); }
 
@@ -1474,6 +1483,7 @@ private:
   // Misc. operations
   const char* name() const;
   const char* type_name() const { return "JavaThread"; }
+  static const char* name_for(oop thread_obj);
 
   void print_on(outputStream* st, bool print_extended_info) const;
   void print_on(outputStream* st) const { print_on(st, false); }
@@ -1527,6 +1537,9 @@ private:
   static JavaThread* current() {
     return JavaThread::cast(Thread::current());
   }
+
+  // Returns the current thread as a JavaThread, or NULL if not attached
+  static inline JavaThread* current_or_null();
 
   // Casts
   static JavaThread* cast(Thread* t) {
@@ -1699,7 +1712,27 @@ public:
   static OopStorage* thread_oop_storage();
 
   static void verify_cross_modify_fence_failure(JavaThread *thread) PRODUCT_RETURN;
+
+  // Helper function to create the java.lang.Thread object for a
+  // VM-internal thread. The thread will have the given name, be
+  // part of the System ThreadGroup and if is_visible is true will be
+  // discoverable via the system ThreadGroup.
+  static Handle create_system_thread_object(const char* name, bool is_visible, TRAPS);
+
+  // Helper function to start a VM-internal daemon thread.
+  // E.g. ServiceThread, NotificationThread, CompilerThread etc.
+  static void start_internal_daemon(JavaThread* current, JavaThread* target,
+                                    Handle thread_oop, ThreadPriority prio);
+
+  // Helper function to do vm_exit_on_initialization for osthread
+  // resource allocation failure.
+  static void vm_exit_on_osthread_failure(JavaThread* thread);
 };
+
+inline JavaThread* JavaThread::current_or_null() {
+  Thread* current = Thread::current_or_null();
+  return current != nullptr ? JavaThread::cast(current) : nullptr;
+}
 
 // The active thread queue. It also keeps track of the current used
 // thread priorities.

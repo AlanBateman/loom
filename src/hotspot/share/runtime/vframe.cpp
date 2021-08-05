@@ -137,7 +137,14 @@ javaVFrame* vframe::java_sender() const {
   return NULL;
 }
 
+extern "C" bool dbg_is_safe(const void* p, intptr_t errvalue);
+
 void vframe::restore_register_map() const {
+  assert (this != NULL, "");
+  assert (dbg_is_safe(this, -1), "");
+  assert (register_map() != NULL, "");
+  assert (dbg_is_safe(register_map(), -1), "");
+
   if (_reg_map.stack_chunk()() != stack_chunk()) {
     const_cast<vframe*>(this)->_reg_map.set_stack_chunk(stack_chunk());
   }
@@ -653,8 +660,9 @@ void vframeStreamCommon::skip_prefixed_method_and_wrappers() {
 
 javaVFrame* vframeStreamCommon::asJavaVFrame() {
   javaVFrame* result = NULL;
+  // FIXME, need to re-do JDK-8271140 and check is_native_frame?
   if (_mode == compiled_mode && _frame.is_compiled_frame()) {
-    guarantee(_frame.is_compiled_frame(), "expected compiled Java frame");
+    assert(_frame.is_compiled_frame() || _frame.is_native_frame(), "expected compiled Java frame");
     guarantee(_reg_map.update_map(), "");
 
     compiledVFrame* cvf = compiledVFrame::cast(vframe::new_vframe(&_frame, &_reg_map, _thread));
@@ -671,7 +679,7 @@ javaVFrame* vframeStreamCommon::asJavaVFrame() {
   } else {
     result = javaVFrame::cast(vframe::new_vframe(&_frame, &_reg_map, _thread));
   }
-  guarantee(result->method() == method(), "wrong method");
+  assert(result->method() == method(), "wrong method");
   return result;
 }
 

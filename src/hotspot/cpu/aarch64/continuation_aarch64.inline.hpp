@@ -65,8 +65,9 @@ static inline intptr_t** link_address(const frame& f) {
 }
 
 static void patch_callee_link(const frame& f, intptr_t* fp) {
+  DEBUG_ONLY(intptr_t* orig = *Frame::callee_link_address(f));
   *Frame::callee_link_address(f) = fp;
-  log_trace(jvmcont)("patched link at " INTPTR_FORMAT ": " INTPTR_FORMAT, p2i(Frame::callee_link_address(f)), p2i(fp));
+  log_develop_trace(jvmcont)("patched link at " INTPTR_FORMAT ": " INTPTR_FORMAT " orig: " INTPTR_FORMAT, p2i(Frame::callee_link_address(f)), p2i(fp), p2i(orig));
 }
 
 static void patch_callee_link_relative(const frame& f, intptr_t* fp) {
@@ -408,7 +409,7 @@ inline void Thaw<ConfigT>::patch_pd(frame& f, const frame& caller) {
 template <typename ConfigT>
 intptr_t* Thaw<ConfigT>::push_interpreter_return_frame(intptr_t* sp) {
   address pc = StubRoutines::cont_interpreter_forced_preempt_return();
-  intptr_t* fp = *(intptr_t**)(sp - frame::sender_sp_offset);
+  intptr_t* fp = sp - frame::sender_sp_offset;
 
   log_develop_trace(jvmcont)("push_interpreter_return_frame initial sp: " INTPTR_FORMAT " final sp: " INTPTR_FORMAT " fp: " INTPTR_FORMAT, p2i(sp), p2i(sp - ContinuationHelper::frame_metadata), p2i(fp));
 

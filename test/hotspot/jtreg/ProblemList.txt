@@ -91,6 +91,7 @@ gc/metaspace/CompressedClassSpaceSizeInJmapHeap.java 8241293 macosx-x64
 
 runtime/cds/appcds/jigsaw/modulepath/ModulePathAndCP_JFR.java 8253437 windows-x64
 runtime/cds/DeterministicDump.java 8253495 generic-all
+runtime/InvocationTests/invokevirtualTests.java 8271125 generic-all
 runtime/jni/terminatedThread/TestTerminatedThread.java 8219652 aix-ppc64
 runtime/os/TestTracePageSizes.java#no-options 8267460 linux-aarch64
 runtime/os/TestTracePageSizes.java#explicit-large-page-size 8267460 linux-aarch64
@@ -98,6 +99,8 @@ runtime/os/TestTracePageSizes.java#compiler-options 8267460 linux-aarch64
 runtime/os/TestTracePageSizes.java#with-G1 8267460 linux-aarch64
 runtime/os/TestTracePageSizes.java#with-Parallel 8267460 linux-aarch64
 runtime/os/TestTracePageSizes.java#with-Serial 8267460 linux-aarch64
+
+applications/jcstress/copy.java 8229852 linux-x64
 
 #############################################################################
 
@@ -107,10 +110,15 @@ serviceability/sa/sadebugd/DebugdConnectTest.java 8239062 macosx-x64
 serviceability/sa/TestRevPtrsForInvokeDynamic.java 8241235 generic-all
 resourcehogs/serviceability/sa/TestHeapDumpForLargeArray.java 8262386 generic-all
 
-serviceability/jvmti/HeapMonitor/MyPackage/HeapMonitorStatIntervalTest.java 8214032 generic-all
-serviceability/jvmti/HeapMonitor/MyPackage/HeapMonitorStatArrayCorrectnessTest.java 8224150 generic-all
 serviceability/jvmti/ModuleAwareAgents/ThreadStart/MAAThreadStart.java 8225354 windows-all
 serviceability/dcmd/gc/RunFinalizationTest.java 8227120 linux-all,windows-x64
+
+serviceability/sa/ClhsdbCDSCore.java 8269982 macosx-aarch64
+serviceability/sa/ClhsdbFindPC.java#id1 8269982 macosx-aarch64
+serviceability/sa/ClhsdbFindPC.java#id3 8269982 macosx-aarch64
+serviceability/sa/ClhsdbPstack.java#id1 8269982 macosx-aarch64
+
+serviceability/dcmd/gc/HeapDumpAllTest.java 8270341 generic-x64
 
 #############################################################################
 
@@ -175,6 +183,13 @@ compiler/whitebox/ForceNMethodSweepTest.java                                  82
 runtime/clinit/ClassInitBarrier.java                                          8254936 generic-all
 runtime/vthread/TestObjectAllocationSampleEvent.java                          8261379 generic-all
 
+runtime/ErrorHandling/NestedThreadsListHandleInErrorHandlingTest.java         8269959 generic-all
+runtime/ErrorHandling/ThreadsListHandleInErrorHandlingTest.java               8269959 generic-all
+
+runtime/cds/appcds/dynamicArchive/methodHandles/MethodHandlesAsCollectorTest.java 8271008 generic-all
+runtime/cds/appcds/methodHandles/MethodHandlesAsCollectorTest.java                8271008 generic-all
+
+
 serviceability/jvmti/vthread/DoContinueSingleStepTest/DoContinueSingleStepTest.java    0000000 generic-all
 serviceability/jvmti/events/FramePop/framepop02/framepop02.java               0000000 generic-all
 serviceability/sa/JhsdbThreadInfoTest.java 8243016 generic-all
@@ -210,6 +225,3 @@ vmTestbase/nsk/jvmti/scenarios/hotswap/HS203/hs203t003/hs203t003.java         00
 vmTestbase/nsk/jvmti/scenarios/hotswap/HS203/hs203t002/hs203t002.java         0000000 generic-all
 vmTestbase/nsk/jvmti/scenarios/hotswap/HS203/hs203t001/hs203t001.java         0000000 generic-all
 vmTestbase/nsk/jvmti/scenarios/hotswap/HS202/hs202t002/hs202t002.java         0000000 generic-all
-
-#value of ScopeLocalCacheSize should be verfied to don't crash
-runtime/CommandLine/OptionsValidation/TestOptionsWithRanges.java#id7          0000000 generic-all

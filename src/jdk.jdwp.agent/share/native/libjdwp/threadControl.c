@@ -1579,9 +1579,9 @@ threadControl_suspendCount(jthread thread, jint *count)
         node = findThread(&runningVThreads, thread);
     } else {
         node = findThread(&runningThreads, thread);
-        if (node == NULL) {
-            node = findThread(&otherThreads, thread);
-        }
+    }
+    if (node == NULL) {
+        node = findThread(&otherThreads, thread);
     }
 
     error = JVMTI_ERROR_NONE;
@@ -1592,8 +1592,22 @@ threadControl_suspendCount(jthread thread, jint *count)
          * If the node is in neither list, the debugger never suspended
          * this thread, so the suspend count is 0.
          */
-        // vthread fixme: use suspendAllCount if vthread has started
+      if (is_vthread) {
+          jint vthread_state = 0;
+          jvmtiError error = threadState(thread, &vthread_state);
+          if (error != JVMTI_ERROR_NONE) {
+              EXIT_ERROR(error, "getting thread state");
+          }
+          if (vthread_state == 0) {
+              // If state == 0, then this is a new vthread that has not been started yet.
+              *count = 0;
+          } else {
+              // This is a started vthread that we are not tracking. Use suspendAllCount.
+              *count = suspendAllCount;
+          }
+      } else {
         *count = 0;
+      }
     }
 
     debugMonitorExit(threadLock);
@@ -1748,6 +1762,29 @@ resumeHelper(JNIEnv *env, ThreadNode *node, void *ignored)
     return resumeThreadByNode(node);
 }
 
+static jvmtiError
+excludeCountHelper(JNIEnv *env, ThreadNode *node, void *arg)
+{
+    JDI_ASSERT(node->is_vthread);
+    if (node->suspendCount > 0) {
+        jint *counter = (jint *)arg;
+        (*counter)++;
+    }
+    return JVMTI_ERROR_NONE;
+}
+
+static jvmtiError
+excludeCopyHelper(JNIEnv *env, ThreadNode *node, void *arg)
+{
+    JDI_ASSERT(node->is_vthread);
+    if (node->suspendCount > 0) {
+        jthread **listPtr = (jthread **)arg;
+        **listPtr = node->thread;
+        (*listPtr)++;
+    }
+    return JVMTI_ERROR_NONE;
+}
+
 jvmtiError
 threadControl_resumeAll(void)
 {
@@ -1766,9 +1803,31 @@ threadControl_resumeAll(void)
 
     if (gdata->vthreadsSupported) {
         if (suspendAllCount == 1) {
-            /* Tell JVMTI to resume all virtual threads. */
+            jint excludeCnt = 0;
+            jthread *excludeList = NULL;
+            /*
+             * Tell JVMTI to resume all virtual threads except for those we
+             * are tracking separately. The commonResumeList() call below will
+             * resume any vthread with a suspendCount == 1, and we want to ignore
+             * vthreads with a suspendCount > 0. Therefor we don't want
+             * ResumeAllVirtualThreads resuming these vthreads. We must first
+             * build a list of them to pass to as the exclude list.
+             */
+            enumerateOverThreadList(env, &runningVThreads, excludeCountHelper,
+                                    &excludeCnt);
+            if (excludeCnt > 0) {
+                excludeList = newArray(excludeCnt, sizeof(jthread));
+                if (excludeList == NULL) {
+                    EXIT_ERROR(AGENT_ERROR_OUT_OF_MEMORY,"exclude list");
+                }
+                {
+                    jthread *excludeListPtr = excludeList;
+                    enumerateOverThreadList(env, &runningVThreads, excludeCopyHelper,
+                                            &excludeListPtr);
+                }
+            }
             error = JVMTI_FUNC_PTR(gdata->jvmti,ResumeAllVirtualThreads)
-                    (gdata->jvmti, 0, NULL);
+                    (gdata->jvmti, excludeCnt, excludeList);
             if (error != JVMTI_ERROR_NONE) {
                 EXIT_ERROR(error, "cannot resume all virtual threads");
             }
@@ -2279,6 +2338,10 @@ threadControl_onEventHandlerEntry(jbyte sessionID, EventInfo *evinfo, jobject cu
          * to precede thread start for some VM implementations.
          */
         if (evinfo->is_vthread) {
+          /* fiber fixme: don't add the vthread if this is an EI_THREAD_START or
+             EI_THREAD_EXIT event. Otherwise we end up adding every vthread. This
+             is an issue when notifyVThreads is true, which is the default.
+          */
             node = insertThread(env, &runningVThreads, thread);
         } else {
             node = insertThread(env, &runningThreads, thread);

@@ -441,6 +441,7 @@ int LIR_Assembler::emit_unwind_handler() {
     stub = new MonitorExitStub(FrameMap::r0_opr, true, 0);
     __ unlock_object(r5, r4, r0, *stub->entry());
     __ bind(*stub->continuation());
+    __ dec_held_monitor_count(rthread);
   }
 
   if (compilation()->env()->dtrace_method_probes()) {
@@ -784,7 +785,7 @@ void LIR_Assembler::reg2stack(LIR_Opr src, LIR_Opr dest, BasicType type, bool po
 }
 
 
-void LIR_Assembler::reg2mem(LIR_Opr src, LIR_Opr dest, BasicType type, LIR_PatchCode patch_code, CodeEmitInfo* info, bool pop_fpu_stack, bool wide, bool /* unaligned */) {
+void LIR_Assembler::reg2mem(LIR_Opr src, LIR_Opr dest, BasicType type, LIR_PatchCode patch_code, CodeEmitInfo* info, bool pop_fpu_stack, bool wide) {
   LIR_Address* to_addr = dest->as_address_ptr();
   PatchingStub* patch = NULL;
   Register compressed_src = rscratch1;
@@ -941,7 +942,7 @@ void LIR_Assembler::stack2stack(LIR_Opr src, LIR_Opr dest, BasicType type) {
 }
 
 
-void LIR_Assembler::mem2reg(LIR_Opr src, LIR_Opr dest, BasicType type, LIR_PatchCode patch_code, CodeEmitInfo* info, bool wide, bool /* unaligned */) {
+void LIR_Assembler::mem2reg(LIR_Opr src, LIR_Opr dest, BasicType type, LIR_PatchCode patch_code, CodeEmitInfo* info, bool wide) {
   LIR_Address* addr = src->as_address_ptr();
   LIR_Address* from_addr = src->as_address_ptr();
 
@@ -2592,7 +2593,18 @@ void LIR_Assembler::emit_lock(LIR_OpLock* op) {
   } else {
     Unimplemented();
   }
+  if (op->code() == lir_lock) {
+    // If deoptimization happens in Runtime1::monitorenter, inc_held_monitor_count after backing from slowpath
+    // will be skipped. Solution is:
+    // 1. Increase only in fastpath
+    // 2. Runtime1::monitorenter increase count after locking
+    __ inc_held_monitor_count(rthread);
+  }
   __ bind(*op->stub()->continuation());
+  if (op->code() == lir_unlock) {
+    // unlock in slowpath is JRT_Leaf stub, no deoptimization can happen
+    __ dec_held_monitor_count(rthread);
+  }
 }
 
 
@@ -2835,7 +2847,7 @@ void LIR_Assembler::emit_profile_type(LIR_OpProfileType* op) {
         }
 #endif
         // first time here. Set profile type.
-        __ ldr(tmp, mdo_addr);
+        __ str(tmp, mdo_addr);
       } else {
         assert(ciTypeEntries::valid_ciklass(current_klass) != NULL &&
                ciTypeEntries::valid_ciklass(current_klass) != exact_klass, "inconsistent");
@@ -2910,7 +2922,7 @@ void LIR_Assembler::rt_call(LIR_Opr result, address dest, const LIR_OprList* arg
 void LIR_Assembler::volatile_move_op(LIR_Opr src, LIR_Opr dest, BasicType type, CodeEmitInfo* info) {
   if (dest->is_address() || src->is_address()) {
     move_op(src, dest, type, lir_patch_none, info,
-            /*pop_fpu_stack*/false, /*unaligned*/false, /*wide*/false);
+            /*pop_fpu_stack*/false, /*wide*/false);
   } else {
     ShouldNotReachHere();
   }
