@@ -30,10 +30,8 @@ import java.security.AccessController;
 import java.security.PrivilegedAction;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.Comparator;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 import jdk.internal.javac.PreviewFeature;
@@ -60,8 +58,8 @@ import jdk.internal.misc.ThreadFlock;
  * {@snippet lang=java :
  *     try (var scope = new StructuredTaskScope<Object>()) {
  *
- *         Future<Integer> future1 = scope.fork(task1);   // @highlight substring="fork"
- *         Future<String> future2 = scope.fork(task2);    // @highlight substring="fork"
+ *         Handle<Integer> handle1 = scope.fork(task1);   // @highlight substring="fork"
+ *         Handle<String> handle2 = scope.fork(task2);    // @highlight substring="fork"
  *
  *         scope.join();                                  // @highlight substring="join"
  *
@@ -70,7 +68,7 @@ import jdk.internal.misc.ThreadFlock;
  *     } // close                                         // @highlight substring="close"
  * }
  * To ensure correct usage, the {@code join} and {@code close} methods may only be invoked
- * by the <em>owner</em> (the thread that opened/created the task scope}, and the
+ * by the <em>owner</em> (the thread that opened/created the task scope), and the
  * {@code close} method throws an exception after closing if the owner did not invoke the
  * {@code join} method after forking.
  *
@@ -128,16 +126,15 @@ import jdk.internal.misc.ThreadFlock;
  * result, either fails, or a deadline is reached. It invokes {@link
  * ShutdownOnFailure#throwIfFailed(Function) throwIfFailed(Function)} to throw an exception
  * when either subtask fails. This method is a no-op if no subtasks fail. The main task
- * uses {@code Future}'s {@link Future#resultNow() resultNow()} method to retrieve the
- * results.
+ * uses {@link Handle#result()} method to retrieve the result of each subtask.
  *
  * {@snippet lang=java :
  *    Instant deadline = ...
  *
  *    try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
  *
- *         Future<String> future1 = scope.fork(() -> query(left));
- *         Future<String> future2 = scope.fork(() -> query(right));
+ *         Handle<String> handle1 = scope.fork(() -> query(left));
+ *         Handle<String> handle2 = scope.fork(() -> query(right));
  *
  *         scope.joinUntil(deadline);
  *
@@ -145,9 +142,8 @@ import jdk.internal.misc.ThreadFlock;
  *         scope.throwIfFailed(e -> new WebApplicationException(e));
  *
  *         // both subtasks completed successfully
- *         String result = Stream.of(future1, future2)
- *                 // @link substring="Future::resultNow" target="Future#resultNow" :
- *                 .map(Future::resultNow)
+ *         String result = Stream.of(handle1, handle1)
+ *                 .map(Handle::result)
  *                 .collect(Collectors.joining(", ", "{ ", " }"));
  *
  *         ...
@@ -156,13 +152,13 @@ import jdk.internal.misc.ThreadFlock;
  *
  * <h2>Extending StructuredTaskScope</h2>
  *
- * {@code StructuredTaskScope} can be extended, and the {@link #handleComplete(Future)
- * handleComplete} overridden, to implement policies other than those implemented by
- * {@code ShutdownOnSuccess} and {@code ShutdownOnFailure}. The method may be overridden
- * to, for example, collect the results of subtasks that complete with a result and ignore
- * subtasks that fail. It may collect exceptions when subtasks fail. It may invoke the
- * {@link #shutdown() shutdown} method to shut down and cause {@link #join() join} to
- * wakeup when some condition arises.
+ * {@code StructuredTaskScope} can be extended, and the {@link
+ * #handleComplete(Callable, Object, Throwable) handleComplete} method overridden, to
+ * implement policies other than those implemented by {@code ShutdownOnSuccess} and
+ * {@code ShutdownOnFailure}. The method may be overridden to, for example, collect the
+ * results of subtasks that complete with a result and ignore subtasks that fail. It may
+ * collect exceptions when subtasks fail. It may invoke the {@link #shutdown() shutdown}
+ * method to shut down and cause {@link #join() join} to wakeup when some condition arises.
  *
  * <p> A subclass will typically define methods to make available results, state, or other
  * outcome to code that executes after the {@code join} method. A subclass that collects
@@ -184,9 +180,8 @@ import jdk.internal.misc.ThreadFlock;
  *
  *         @Override
  *         // @link substring="handleComplete" target="handleComplete" :
- *         protected void handleComplete(Future<T> future) {
- *             if (future.state() == Future.State.SUCCESS) {
- *                 T result = future.resultNow();
+ *         protected void handleComplete(Callable<T> task, T result, Throwable exception) {
+ *             if (exception == null) {
  *                 results.add(result);
  *             }
  *         }
@@ -261,8 +256,8 @@ import jdk.internal.misc.ThreadFlock;
  * {@linkplain #fork forking} of a {@code Callable} task
  * <a href="{@docRoot}/java.base/java/util/concurrent/package-summary.html#MemoryVisibility">
  * <i>happen-before</i></a> any actions taken by that task, which in turn <i>happen-before</i>
- * the task result is retrieved via its {@code Future}, or <i>happen-before</i> any actions
- * taken in a thread after {@linkplain #join() joining} of the task scope.
+ * the task result is retrieved via its {@code Handle}, or <i>happen-before</i> any
+ * actions taken in a thread after {@linkplain #join() joining} of the task scope.
  *
  * @jls 17.4.5 Happens-before Order
  *
@@ -271,22 +266,9 @@ import jdk.internal.misc.ThreadFlock;
  */
 @PreviewFeature(feature = PreviewFeature.Feature.STRUCTURED_CONCURRENCY)
 public class StructuredTaskScope<T> implements AutoCloseable {
-    private static final VarHandle FUTURES;
-    static {
-        try {
-            MethodHandles.Lookup l = MethodHandles.lookup();
-            FUTURES = l.findVarHandle(StructuredTaskScope.class, "futures", Set.class);
-        } catch (Exception e) {
-            throw new InternalError(e);
-        }
-    }
-
     private final ThreadFactory factory;
     private final ThreadFlock flock;
     private final ReentrantLock shutdownLock = new ReentrantLock();
-
-    // lazily created set of Future objects with threads waiting in Future::get
-    private volatile Set<Future<?>> futures;
 
     // set by owner when it forks, reset by owner when it joins
     private boolean needJoin;
@@ -298,6 +280,64 @@ public class StructuredTaskScope<T> implements AutoCloseable {
 
     // scope state, set by owner, read by any thread
     private volatile int state;
+
+    /**
+     * A handle to a task worked with {@linkplain #fork(Callable)}.
+     * @param <T> the result type
+     * @since 21
+     */
+    @PreviewFeature(feature = PreviewFeature.Feature.STRUCTURED_CONCURRENCY)
+    public interface Handle<T> {
+        /**
+         * Represents the state of a task.
+         * @since 21
+         */
+        @PreviewFeature(feature = PreviewFeature.Feature.STRUCTURED_CONCURRENCY)
+        enum State {
+            /**
+             * The task has not completed.
+             */
+            RUNNING,
+            /**
+             * The task completed with a result.
+             * @see Handle#result()
+             */
+            SUCCESS,
+            /**
+             * The task completed with an exception.
+             * @see Handle#exception()
+             */
+            FAILED,
+            /**
+             * The task was cancelled.
+             * @see StructuredTaskScope#shutdown()
+             */
+            CANCELLED
+        }
+
+        /**
+         * {@return the state of the task}
+         */
+        State state();
+
+        /**
+         * {@return the result, if the task completed normally}
+         * @throws IllegalStateException if the task has not completed, the task
+         * completed abnormally, or the scope was shutdown before the task completed
+         * @throws IllegalStateException if the current thread is the task scope owner
+         * and it did not invoke join after forking
+         */
+        T result();
+
+        /**
+         * {@return the exception, if the task completed abnormally}
+         * @throws IllegalStateException if the task has not completed, the task
+         * completed normally, or the scope was shutdown before the task completed
+         * @throws IllegalStateException if the current thread is the task scope owner
+         * and it did not invoke join after forking
+         */
+        Throwable exception();
+    }
 
     /**
      * Creates a structured task scope with the given name and thread factory. The task
@@ -333,6 +373,38 @@ public class StructuredTaskScope<T> implements AutoCloseable {
     }
 
     /**
+     * Return true if the task scope is shutdown.
+     */
+    private boolean isShutdown() {
+        return state >= SHUTDOWN;
+    }
+
+    /**
+     * Return true if the task scope is closed.
+     */
+    private boolean isClosed() {
+        return state == CLOSED;
+    }
+
+    private IllegalStateException newIllegalStateExceptionScopeClosed() {
+        return new IllegalStateException("Task scope is closed");
+    }
+
+    private IllegalStateException newIllegalStateExceptionNoJoin() {
+        return new IllegalStateException("Owner did not invoke join or joinUntil after fork");
+    }
+
+    /**
+     * Throws IllegalStateException if the scope is closed, returning the current state.
+     */
+    private int ensureOpen() {
+        int s = state;
+        if (s == CLOSED)
+            throw newIllegalStateExceptionScopeClosed();
+        return s;
+    }
+
+    /**
      * Throws WrongThreadException if the current thread is not the owner.
      */
     private void ensureOwner() {
@@ -351,47 +423,119 @@ public class StructuredTaskScope<T> implements AutoCloseable {
     }
 
     /**
-     * Tests if the task scope is shutdown.
+     * Throws IllegalStateException if the current thread is the owner and it did
+     * not invoke join after forking
      */
-    private boolean isShutdown() {
-        return state >= SHUTDOWN;
-    }
-
-    /**
-     * Track the given Future.
-     */
-    private void track(Future<?> future) {
-        // create the set of Futures if not already created
-        Set<Future<?>> futures = this.futures;
-        if (futures == null) {
-            futures = ConcurrentHashMap.newKeySet();
-            if (!FUTURES.compareAndSet(this, null, futures)) {
-                // lost the race
-                futures = this.futures;
-            }
+    private void ensureJoinedIfOwner() {
+        if (Thread.currentThread() == flock.owner() && needJoin) {
+            throw newIllegalStateExceptionNoJoin();
         }
-        futures.add(future);
     }
 
     /**
-     * Stop tracking the Future.
+     * Ensures that the current thread is the task scope owner and that the {@link #join()}
+     * or {@link #joinUntil(Instant)} method has been called after {@linkplain
+     * #fork(Callable) forking}.
+     *
+     * @apiNote This method can be used by subclasses that define methods to make available
+     * results, state, or other outcome to code intended to execute after the join method.
+     *
+     * @throws WrongThreadException if the current thread is not the task scope owner
+     * @throws IllegalStateException if the task scope owner did not invoke join after
+     * forking
      */
-    private void untrack(Future<?> future) {
-        assert futures != null;
-        futures.remove(future);
+    protected final void ensureOwnerAndJoined() {
+        ensureOwner();
+        if (needJoin) {
+            throw newIllegalStateExceptionNoJoin();
+        }
     }
 
     /**
      * Invoked when a task completes before the scope is shut down.
      *
-     * <p> The {@code handleComplete} method should be thread safe. It may be invoked by
-     * several threads concurrently.
+     * <p> If the task completed successfully then this method is invoked with the result
+     * (which may be {@code null}) and a {@code null} exception.
      *
-     * @implSpec The default implementation does nothing.
+     * <p> If the task completed with an exception then this method is invoked with a
+     * {@code null} result and a non-{@code null} exception.
      *
-     * @param future the completed task
+     * @implSpec The default implementation throws {@code NullPointerException} if task
+     * is null. It throws {@code IllegalArgumentException} if both the result and
+     * exception are non-{@code null}.
+     *
+     * @apiNote The {@code handleComplete} method should be thread safe. It may be
+     * invoked by several threads concurrently.
+     *
+     * @param task the task
+     * @param result the result if the task completed successfully, can be null
+     * @param exception the exception if the task completed abnormally, otherwise null
+     *
+     * @throws IllegalArgumentException if both result and exception are non-{@code null}
      */
-    protected void handleComplete(Future<T> future) { }
+    protected void handleComplete(Callable<T> task, T result, Throwable exception) {
+        Objects.requireNonNull(task);
+        if (result != null && exception != null)
+            throw new IllegalArgumentException("result and exception are non-null");
+    }
+
+//    /**
+//     * Starts a new thread to run the given task.
+//     *
+//     * <p> The new thread is created with the task scope's {@link ThreadFactory}. It
+//     * inherits the current thread's {@linkplain ScopedValue scoped value} bindings. The
+//     * bindings must match the bindings captured when the task scope was created.
+//     *
+//     * <p> The fork method returns a {@link Supplier} to supply the result when the task
+//     * completes normally. The {@code Supplier}'s {@linkplain Supplier#get() get}
+//     * method is intended to be called after waiting for all threads to finish (with
+//     * {@link #join() join}) and when it is known that the task completed with a result.
+//     * The {@code get} method throws {@code IllegalStateException} when
+//     * <ul>
+//     *     <li> The task has not completed. </li>
+//     *     <li> The task completed abnormally (with an exception). </li>
+//     *     <li> The scope was shutdown before the task completed. </li>
+//     *     <li> Called by the task scope owner before waiting for all threads to finish
+//     *          after forking. </li>
+//     * </ul>
+//     *
+//     * <p> If this task scope is {@linkplain #shutdown() shutdown} (or in the process
+//     * of shutting down) then the task will not run. In that case, this method returns
+//     * a {@link Supplier} that throws {@code IllegalStateException} unconditionally.
+//     *
+//     * <p> If the task completes before the task scope is {@link #shutdown() shutdown}
+//     * then the {@link #handleComplete(Callable, Object, Throwable) handleComplete} method
+//     * is invoked to consume the completed task. If the task scope is shutdown at or around
+//     * the same time that the task completes then the {@code handleComplete} method may
+//     * or may not be invoked.
+//     *
+//     * <p> This method may only be invoked by the task scope owner or threads contained
+//     * in the task scope.
+//     *
+//     * @param task the task to run
+//     * @param <U> the result type
+//     * @return a supplier of the result
+//     * @throws IllegalStateException if this task scope is closed
+//     * @throws WrongThreadException if the current thread is not the task scope owner or
+//     * a thread contained in the task scope
+//     * @throws StructureViolationException if the current scoped value bindings are not
+//     * the same as when the task scope was created
+//     * @throws RejectedExecutionException if the thread factory rejected creating a
+//     * thread to run the task
+//     */
+//    public <U extends T> Supplier<U> fork2(Callable<? extends U> task) {
+//        Handle<U> handle = fork(task);
+//        return new Supplier<U>() {
+//            @Override
+//            public U get() {
+//                return handle.result();
+//            }
+//            @Override
+//            public String toString() {
+//                return handle.toString();
+//            }
+//        };
+//    }
 
     /**
      * Starts a new thread to run the given task.
@@ -400,49 +544,47 @@ public class StructuredTaskScope<T> implements AutoCloseable {
      * inherits the current thread's {@linkplain ScopedValue scoped value} bindings. The
      * bindings must match the bindings captured when the task scope was created.
      *
-     * <p> If the task completes before the task scope is {@link #shutdown() shutdown}
-     * then the {@link #handleComplete(Future) handleComplete} method is invoked to
-     * consume the completed task. The {@code handleComplete} method is run when the task
-     * completes with a result or exception. If the {@code Future}'s {@link
-     * Future#cancel(boolean) cancel} method is used to cancel a task before the task scope
-     * is shut down, then the {@code handleComplete} method is run by the thread that
-     * invokes {@code cancel}. If the task scope shuts down at or around the same time
-     * that the task completes or is cancelled then the {@code handleComplete} method may
-     * or may not be invoked.
+     * <p> The fork method returns a {@link Handle Handle} to the forked task. The handle
+     * can be used to obtain the result when the task completes normally, or the exception
+     * when task completes abnormally. To ensure correct usage, the {@link Handle#result()
+     * result()} and {@link Handle#exception() exception()} methods may only be called by
+     * the task scope owner after it has waited for all threads to finish with the
+     * {@link #join() join} or {@link #joinUntil(Instant)} methods.
      *
      * <p> If this task scope is {@linkplain #shutdown() shutdown} (or in the process
-     * of shutting down) then {@code fork} returns a {@code Future} representing a {@link
-     * Future.State#CANCELLED cancelled} task that was not run.
+     * of shutting down) then the task will not run. In that case, this method returns
+     * a handle representing a {@linkplain Handle.State#CANCELLED cancelled} task.
+     *
+     * <p> If the task completes before the task scope is {@link #shutdown() shutdown}
+     * then the {@link #handleComplete(Callable, Object, Throwable) handleComplete} method
+     * is invoked to consume the completed task. If the task scope is shutdown at or around
+     * the same time that the task completes then the {@code handleComplete} method may
+     * or may not be invoked.
      *
      * <p> This method may only be invoked by the task scope owner or threads contained
-     * in the task scope. The {@link Future#cancel(boolean) cancel} method of the returned
-     * {@code Future} object is also restricted to the task scope owner or threads contained
-     * in the task scope. The {@code cancel} method throws {@link WrongThreadException}
-     * if invoked from another thread. All other methods on the returned {@code Future}
-     * object, such as {@link Future#get() get}, are not restricted.
+     * in the task scope.
      *
      * @param task the task to run
      * @param <U> the result type
-     * @return a future
+     * @return the handle to the forked task
      * @throws IllegalStateException if this task scope is closed
-     * @throws WrongThreadException if the current thread is not the owner or a thread
-     * contained in the task scope
+     * @throws WrongThreadException if the current thread is not the task scope owner or a
+     * thread contained in the task scope
      * @throws StructureViolationException if the current scoped value bindings are not
      * the same as when the task scope was created
      * @throws RejectedExecutionException if the thread factory rejected creating a
      * thread to run the task
      */
-    public <U extends T> Future<U> fork(Callable<? extends U> task) {
+    public <U extends T> Handle<U> fork(Callable<? extends U> task) {
         Objects.requireNonNull(task, "'task' is null");
+        int s = ensureOpen();
 
-        // create future
-        var future = new FutureImpl<U>(this, task);
+        TaskRunner<U> runner = new TaskRunner<>(this, task);
+        boolean started = false;
 
-        boolean shutdown = (state >= SHUTDOWN);
-
-        if (!shutdown) {
-            // create thread
-            Thread thread = factory.newThread(future);
+        if (s == OPEN) {
+            // create thread to run task
+            Thread thread = factory.newThread(runner);
             if (thread == null) {
                 throw new RejectedExecutionException("Rejected by thread factory");
             }
@@ -450,26 +592,21 @@ public class StructuredTaskScope<T> implements AutoCloseable {
             // attempt to start the thread
             try {
                 flock.start(thread);
+                started = true;
             } catch (IllegalStateException e) {
-                // shutdown or in the process of shutting down
-                shutdown = true;
+                // shutdown (or underlying flock is shutdown)
             }
         }
 
-        if (shutdown) {
-            if (state == CLOSED) {
-                throw new IllegalStateException("Task scope is closed");
-            } else {
-                future.cancel(false);
-            }
-        }
-
-        // if owner forks then it will need to join
-        if (Thread.currentThread() == flock.owner() && !needJoin) {
+        if (!started) {
+            runner.tryCancel();
+        } else if (Thread.currentThread() == flock.owner() && !needJoin) {
+            // force owner to join
             needJoin = true;
         }
 
-        return future;
+        // return handle to forked or cancelled task
+        return new HandleImpl<>(runner);
     }
 
     /**
@@ -480,12 +617,9 @@ public class StructuredTaskScope<T> implements AutoCloseable {
     {
         ensureOwner();
         needJoin = false;
-        int s = state;
-        if (s >= SHUTDOWN) {
-            if (s == CLOSED)
-                throw new IllegalStateException("Task scope is closed");
+        int s = ensureOpen();
+        if (s != OPEN)
             return;
-        }
 
         // wait for all threads, wakeup, interrupt, or timeout
         if (timeout != null) {
@@ -498,15 +632,15 @@ public class StructuredTaskScope<T> implements AutoCloseable {
     /**
      * Wait for all threads to finish or the task scope to shut down. This method waits
      * until all threads started in the task scope finish execution (of both task and
-     * {@link #handleComplete(Future) handleComplete} method), the {@link #shutdown()
-     * shutdown} method is invoked to shut down the task scope, or the current thread
-     * is {@linkplain Thread#interrupt() interrupted}.
+     * {@link #handleComplete(Callable, Object, Throwable) handleComplete} method), the
+     * {@link #shutdown() shutdown} method is invoked to shut down the task scope, or the
+     * current thread is {@linkplain Thread#interrupt() interrupted}.
      *
      * <p> This method may only be invoked by the task scope owner.
      *
      * @return this task scope
      * @throws IllegalStateException if this task scope is closed
-     * @throws WrongThreadException if the current thread is not the owner
+     * @throws WrongThreadException if the current thread is not the task scope owner
      * @throws InterruptedException if interrupted while waiting
      */
     public StructuredTaskScope<T> join() throws InterruptedException {
@@ -521,17 +655,17 @@ public class StructuredTaskScope<T> implements AutoCloseable {
     /**
      * Wait for all threads to finish or the task scope to shut down, up to the given
      * deadline. This method waits until all threads started in the task scope finish
-     * execution (of both task and {@link #handleComplete(Future) handleComplete} method),
-     * the {@link #shutdown() shutdown} method is invoked to shut down the task scope,
-     * the current thread is {@linkplain Thread#interrupt() interrupted}, or the deadline
-     * is reached.
+     * execution (of both task and {@link #handleComplete(Callable, Object, Throwable)
+     * handleComplete} method), the {@link #shutdown() shutdown} method is invoked to shut
+     * down the task scope, the current thread is {@linkplain Thread#interrupt() interrupted},
+     * or the deadline is reached.
      *
      * <p> This method may only be invoked by the task scope owner.
      *
      * @param deadline the deadline
      * @return this task scope
      * @throws IllegalStateException if this task scope is closed
-     * @throws WrongThreadException if the current thread is not the owner
+     * @throws WrongThreadException if the current thread is not the task scope owner
      * @throws InterruptedException if interrupted while waiting
      * @throws TimeoutException if the deadline is reached while waiting
      */
@@ -544,22 +678,14 @@ public class StructuredTaskScope<T> implements AutoCloseable {
     }
 
     /**
-     * Cancel all tracked Future objects.
-     */
-    private void cancelTrackedFutures() {
-        Set<Future<?>> futures = this.futures;
-        if (futures != null) {
-            futures.forEach(f -> f.cancel(false));
-        }
-    }
-
-    /**
      * Interrupt all unfinished threads.
      */
     private void implInterruptAll() {
         flock.threads().forEach(t -> {
             if (t != Thread.currentThread()) {
-                t.interrupt();
+                try {
+                    t.interrupt();
+                } catch (Throwable ignore) { }
             }
         });
     }
@@ -582,7 +708,8 @@ public class StructuredTaskScope<T> implements AutoCloseable {
      * shutdowns the task scope, false if already shutdown.
      */
     private boolean implShutdown() {
-        if (state < SHUTDOWN) {
+        int s = ensureOpen();
+        if (s < SHUTDOWN) {
             shutdownLock.lock();
             try {
                 if (state < SHUTDOWN) {
@@ -590,13 +717,12 @@ public class StructuredTaskScope<T> implements AutoCloseable {
                     // prevent new threads from starting
                     flock.shutdown();
 
-                    // wakeup any threads waiting in Future::get
-                    cancelTrackedFutures();
+                    // set status before interrupting tasks
+                    state = SHUTDOWN;
 
                     // interrupt all unfinished threads
                     interruptAll();
 
-                    state = SHUTDOWN;
                     return true;
                 }
             } finally {
@@ -615,33 +741,28 @@ public class StructuredTaskScope<T> implements AutoCloseable {
      *
      * <p> More specifically, this method:
      * <ul>
-     * <li> {@linkplain Future#cancel(boolean) Cancels} the tasks that have threads
-     * {@linkplain Future#get() waiting} on a result so that the waiting threads wakeup.
      * <li> {@linkplain Thread#interrupt() Interrupts} all unfinished threads in the
      * task scope (except the current thread).
-     * <li> Wakes up the owner if it is waiting in {@link #join()} or {@link
-     * #joinUntil(Instant)}. If the owner is not waiting then its next call to {@code
-     * join} or {@code joinUntil} will return immediately.
+     * <li> Wakes up the task scope owner if it is waiting in {@link #join()} or {@link
+     * #joinUntil(Instant)}. If the task scope owner is not waiting then its next call to
+     * {@code join} or {@code joinUntil} will return immediately.
      * </ul>
-     *
-     * <p> When this method completes then the {@code Future} objects for all tasks will
-     * be {@linkplain Future#isDone() done}, normally or abnormally. There may still
-     * be threads that have not finished because they are executing code that did not
-     * respond (or respond promptly) to thread interrupt. This method does not wait
-     * for these threads. When the owner invokes the {@link #close() close} method
-     * to close the task scope then it will wait for the remaining threads to finish.
      *
      * <p> This method may only be invoked by the task scope owner or threads contained
      * in the task scope.
      *
+     * @apiNote
+     * There may be threads that have not finished because they are executing code that
+     * did not respond (or respond promptly) to thread interrupt. This method does not wait
+     * for these threads. When the owner invokes the {@link #close() close} method
+     * to close the task scope then it will wait for the remaining threads to finish.
+     *
      * @throws IllegalStateException if this task scope is closed
-     * @throws WrongThreadException if the current thread is not the owner or
+     * @throws WrongThreadException if the current thread is not the task scope owner or
      * a thread contained in the task scope
      */
     public void shutdown() {
         ensureOwnerOrContainsThread();
-        if (state == CLOSED)
-            throw new IllegalStateException("Task scope is closed");
         if (implShutdown())
             flock.wakeup();
     }
@@ -655,7 +776,7 @@ public class StructuredTaskScope<T> implements AutoCloseable {
      * wait for the threads to finish before completing with the interrupt status set.
      *
      * <p> This method may only be invoked by the task scope owner. If the task scope
-     * is already closed then the owner invoking this method has no effect.
+     * is already closed then the task scope owner invoking this method has no effect.
      *
      * <p> A {@code StructuredTaskScope} is intended to be used in a <em>structured
      * manner</em>. If this method is called to close a task scope before nested task
@@ -671,18 +792,18 @@ public class StructuredTaskScope<T> implements AutoCloseable {
      * If a thread terminates without first closing task scopes that it owns then
      * termination will cause the underlying construct of each of its open tasks scopes to
      * be closed. Closing is performed in the reverse order that the task scopes were
-     * created in. Thread termination may therefore be delayed when the owner has to wait
-     * for threads forked in these task scopes to finish.
+     * created in. Thread termination may therefore be delayed when the task scope owner
+     * has to wait for threads forked in these task scopes to finish.
      *
-     * @throws IllegalStateException thrown after closing the task scope if the owner
-     * did not invoke join after forking
-     * @throws WrongThreadException if the current thread is not the owner
+     * @throws IllegalStateException thrown after closing the task scope if the task scope
+     * owner did not invoke join after forking
+     * @throws WrongThreadException if the current thread is not the task scope owner
      * @throws StructureViolationException if a structure violation was detected
      */
     @Override
     public void close() {
         ensureOwner();
-        if (state == CLOSED)
+        if (isClosed())
             return;
 
         try {
@@ -693,7 +814,7 @@ public class StructuredTaskScope<T> implements AutoCloseable {
         }
 
         if (needJoin) {
-            throw new IllegalStateException("Owner did not invoke join or joinUntil after fork");
+            throw newIllegalStateExceptionNoJoin();
         }
     }
 
@@ -715,126 +836,193 @@ public class StructuredTaskScope<T> implements AutoCloseable {
     }
 
     /**
-     * The Future implementation returned by the fork methods. Most methods are
-     * overridden to support cancellation when the task scope is shutdown.
-     * The blocking get methods register the Future with the task scope so that they
-     * are cancelled when the task scope shuts down.
+     * Runs the task specified to fork. If the task completes before the scope is shutdown
+     * then it is runs the handleComplete method with the task result or exception.
      */
-    private static final class FutureImpl<V> extends FutureTask<V> {
-        private final StructuredTaskScope<V> scope;
+    private static class TaskRunner<T> implements Runnable {
+        private static final AltResult RESULT_NULL = new AltResult(Handle.State.SUCCESS);
+        private static final AltResult RESULT_CANCELLED = new AltResult(Handle.State.CANCELLED);
+        private static final VarHandle RESULT;
+        static {
+            try {
+                MethodHandles.Lookup l = MethodHandles.lookup();
+                RESULT = l.findVarHandle(TaskRunner.class, "result", Object.class);
+            } catch (Exception e) {
+                throw new ExceptionInInitializerError(e);
+            }
+        }
+
+        private record AltResult(Handle.State state, Throwable exception) {
+            AltResult(Handle.State state) {
+                this(state, null);
+            }
+            AltResult(Throwable ex) {
+                this(Handle.State.FAILED, ex);
+            }
+        }
+
+        private final StructuredTaskScope<T> scope;
+        private final Callable<T> task;
+        private volatile Object result;
 
         @SuppressWarnings("unchecked")
-        FutureImpl(StructuredTaskScope<? super V> scope, Callable<? extends V> task) {
-            super((Callable<V>) task);
-            this.scope = (StructuredTaskScope<V>) scope;
+        TaskRunner(StructuredTaskScope<? super T> scope, Callable<? extends T> task) {
+            this.scope = (StructuredTaskScope<T>) scope;
+            this.task = (Callable<T>) task;
+        }
+
+        /**
+         * Set result to "CANCELLED" if not already set.
+         */
+        boolean tryCancel() {
+            return RESULT.compareAndSet(this, null, RESULT_CANCELLED);
         }
 
         @Override
-        protected void done() {
+        public void run() {
+            T result = null;
+            Throwable ex = null;
+            try {
+                result = task.call();
+            } catch (Throwable e) {
+                ex = e;
+            }
+
+            // invoke handleComplete if the scope has not shutdown
             if (!scope.isShutdown()) {
-                scope.handleComplete(this);
+                if (ex == null) {
+                    // task succeeded
+                    Object r = (result != null) ? result : RESULT_NULL;
+                    if (RESULT.compareAndSet(this, null, r)) {
+                        scope.handleComplete(task, result, null);
+                    }
+                } else {
+                    // task failed
+                    if (RESULT.compareAndSet(this, null, new AltResult(ex))) {
+                        scope.handleComplete(task, null, ex);
+                    }
+                }
             }
         }
 
-        private void cancelIfShutdown() {
-            if (scope.isShutdown() && !super.isDone()) {
-                super.cancel(false);
+        /**
+         * Returns the result if the task completed normally.
+         */
+        T result() {
+            scope.ensureJoinedIfOwner();
+            Object result = this.result;
+            if (result instanceof AltResult) {
+                if (result == RESULT_NULL) return null;
+            } else if (result != null) {
+                @SuppressWarnings("unchecked")
+                T r = (T) result;
+                return r;
+            }
+
+            throw new IllegalStateException();
+        }
+
+        /**
+         * Returns the exception if the task completed abnormally.
+         */
+        Throwable exception() {
+            scope.ensureJoinedIfOwner();
+            if (result instanceof AltResult alt && alt.state() == Handle.State.FAILED) {
+                return alt.exception();
+            }
+            throw new IllegalStateException();
+        }
+
+
+
+        /**
+         * Returns the state.
+         */
+        Handle.State state() {
+            Object result = this.result;
+            if (result == null && scope.isShutdown()) {
+                // cancelled
+                tryCancel();
+                result = this.result;
+            }
+            if (result == null) {
+                return Handle.State.RUNNING;
+            } else if (result instanceof AltResult alt) {
+                return alt.state();
+            } else {
+                return Handle.State.SUCCESS;
             }
         }
 
-        @Override
-        public boolean isDone() {
-            cancelIfShutdown();
-            return super.isDone();
+        /**
+         * Return string representing the state.
+         */
+        String stateAsString() {
+            return switch (state()) {
+                case RUNNING   -> "[Not completed]";
+                case SUCCESS   -> "[Completed normally]";
+                case FAILED    -> {
+                    Throwable ex = ((AltResult) result).exception();
+                    yield "[Completed exceptionally: " + ex + "]";
+                }
+                case CANCELLED -> "[Cancelled]";
+            };
         }
+    }
 
-        @Override
-        public boolean isCancelled() {
-            cancelIfShutdown();
-            return super.isCancelled();
-        }
+//    /**
+//     * The object to supply the task result, returned by the fork method.
+//     */
+//    private static class ResultSupplier<T> implements Supplier<T> {
+//        private final TaskRunner<T> runner;
+//        ResultSupplier(TaskRunner<T> runner) {
+//            this.runner = runner;
+//        }
+//        @Override
+//        public T get() {
+//            return runner.result();
+//        }
+//        @Override
+//        public String toString() {
+//            return Objects.toIdentityString(this ) + runner.stateAsString();
+//        }
+//    }
 
-        @Override
-        public boolean cancel(boolean mayInterruptIfRunning) {
-            scope.ensureOwnerOrContainsThread();
-            cancelIfShutdown();
-            return super.cancel(mayInterruptIfRunning);
-        }
+    /**
+     * The handle returned by the fork method.
+     */
+    private static class HandleImpl<T> implements Handle<T> {
+        private final TaskRunner<T> runner;
 
-        @Override
-        public V get() throws InterruptedException, ExecutionException {
-            if (super.isDone())
-                return super.get();
-            scope.track(this);
-            try {
-                cancelIfShutdown();
-                return super.get();
-            } finally {
-                scope.untrack(this);
-            }
-        }
-
-        @Override
-        public V get(long timeout, TimeUnit unit)
-                throws InterruptedException, ExecutionException, TimeoutException {
-            Objects.requireNonNull(unit);
-            if (super.isDone())
-                return super.get();
-            scope.track(this);
-            try {
-                cancelIfShutdown();
-                return super.get(timeout, unit);
-            } finally {
-                scope.untrack(this);
-            }
-        }
-
-        @Override
-        public V resultNow() {
-            cancelIfShutdown();
-            return super.resultNow();
-        }
-
-        @Override
-        public Throwable exceptionNow() {
-            cancelIfShutdown();
-            return super.exceptionNow();
+        HandleImpl(TaskRunner<T> runner) {
+            this.runner = runner;
         }
 
         @Override
         public State state() {
-            cancelIfShutdown();
-            return super.state();
+            return runner.state();
+        }
+
+        @Override
+        public T result() {
+            return runner.result();
+        }
+
+        @Override
+        public Throwable exception() {
+            return runner.exception();
         }
 
         @Override
         public String toString() {
-            cancelIfShutdown();
-            return super.toString();
+            return Objects.toIdentityString(this ) + runner.stateAsString();
         }
     }
 
     /**
-     * Maps a Future.State to an int that can be compared.
-     * RUNNING < CANCELLED < FAILED < SUCCESS.
-     */
-    private static int futureStateToInt(Future.State s) {
-        return switch (s) {
-            case RUNNING   -> 0;
-            case CANCELLED -> 1;
-            case FAILED    -> 2;
-            case SUCCESS   -> 3;
-        };
-    }
-
-    // RUNNING < CANCELLED < FAILED < SUCCESS
-    private static final Comparator<Future.State> FUTURE_STATE_COMPARATOR =
-            Comparator.comparingInt(StructuredTaskScope::futureStateToInt);
-
-    /**
      * A {@code StructuredTaskScope} that captures the result of the first subtask to
      * complete successfully. Once captured, it invokes the {@linkplain #shutdown() shutdown}
-     * method to interrupt unfinished threads and wakeup the owner. The policy
+     * method to interrupt unfinished threads and wakeup the task scope owner. The policy
      * implemented by this class is intended for cases where the result of any subtask
      * will do ("invoke any") and where the results of other unfinished subtask are no
      * longer needed.
@@ -847,16 +1035,20 @@ public class StructuredTaskScope<T> implements AutoCloseable {
      */
     @PreviewFeature(feature = PreviewFeature.Feature.STRUCTURED_CONCURRENCY)
     public static final class ShutdownOnSuccess<T> extends StructuredTaskScope<T> {
-        private static final VarHandle FUTURE;
+        private static final Object RESULT_NULL = new Object();
+        private static final VarHandle FIRST_RESULT;
+        private static final VarHandle FIRST_EXCEPTION;
         static {
             try {
                 MethodHandles.Lookup l = MethodHandles.lookup();
-                FUTURE = l.findVarHandle(ShutdownOnSuccess.class, "future", Future.class);
+                FIRST_RESULT = l.findVarHandle(ShutdownOnSuccess.class, "firstResult", Object.class);
+                FIRST_EXCEPTION = l.findVarHandle(ShutdownOnSuccess.class, "firstException", Throwable.class);
             } catch (Exception e) {
-                throw new InternalError(e);
+                throw new ExceptionInInitializerError(e);
             }
         }
-        private volatile Future<T> future;
+        private volatile Object firstResult;
+        private volatile Throwable firstException;
 
         /**
          * Constructs a new {@code ShutdownOnSuccess} with the given name and thread factory.
@@ -889,28 +1081,29 @@ public class StructuredTaskScope<T> implements AutoCloseable {
         }
 
         /**
-         * Shut down the given task scope when invoked for the first time with a {@code
-         * Future} for a task that completed with a result.
+         * Shut down the given task scope when invoked for the first time with a task
+         * that completed with a result.
          *
-         * @param future the completed task
-         * @see #shutdown()
-         * @see Future.State#SUCCESS
+         * @throws IllegalArgumentException {@inheritDoc}
          */
         @Override
-        protected void handleComplete(Future<T> future) {
-            Future.State state = future.state();
-            if (state == Future.State.RUNNING) {
-                throw new IllegalArgumentException("Task is not completed");
+        protected void handleComplete(Callable<T> task, T result, Throwable exception) {
+            super.handleComplete(task, result, exception);
+
+            if (firstResult != null) {
+                // already captured a result
+                return;
             }
 
-            Future<T> f;
-            while (((f = this.future) == null)
-                    || FUTURE_STATE_COMPARATOR.compare(f.state(), state) < 0) {
-                if (FUTURE.compareAndSet(this, f, future)) {
-                    if (state == Future.State.SUCCESS)
-                        shutdown();
-                    break;
+            if (exception == null) {
+                // task succeeded
+                Object r = (result != null) ? result : RESULT_NULL;
+                if (FIRST_RESULT.compareAndSet(this, null, r)) {
+                    shutdown();
                 }
+            } else if (firstException == null) {
+                // capture the exception thrown by the first task that failed
+                FIRST_EXCEPTION.compareAndSet(this, null, exception);
             }
         }
 
@@ -945,33 +1138,32 @@ public class StructuredTaskScope<T> implements AutoCloseable {
          *
          * <p> When no subtask completed with a result but a task completed with an
          * exception then {@code ExecutionException} is thrown with the exception as the
-         * {@linkplain Throwable#getCause() cause}. If only cancelled subtasks were
-         * notified to the {@code handleComplete} method then {@code CancellationException}
-         * is thrown.
-         *
-         * @apiNote This method is intended to be invoked by the task scope owner after it
-         * has invoked {@link #join() join} (or {@link #joinUntil(Instant) joinUntil}).
-         * A future release may add enforcement to prevent the method being called by
-         * other threads or before joining.
+         * {@linkplain Throwable#getCause() cause}.
          *
          * @throws ExecutionException if no subtasks completed with a result but a subtask
          * completed with an exception
-         * @throws CancellationException if all subtasks were cancelled
-         * @throws IllegalStateException if the handle method was not invoked with a
-         * completed subtask
+         * @throws IllegalStateException if the handleComplete method was not invoked with a
+         * completed subtask or the task scope owner did not invoke join after forking
+         * @throws WrongThreadException if the current thread is not the task scope owner
          */
         public T result() throws ExecutionException {
-            Future<T> f = future;
-            if (f == null) {
-                throw new IllegalStateException("No completed subtasks");
-            }
-            return switch (f.state()) {
-                case SUCCESS   -> f.resultNow();
-                case FAILED    -> throw new ExecutionException(f.exceptionNow());
-                case CANCELLED -> throw new CancellationException();
-                default        -> throw new InternalError("Unexpected state: " + f);
-            };
+            ensureOwnerAndJoined();
 
+            Object result = firstResult;
+            if (result == RESULT_NULL) {
+                return null;
+            } else if (result != null) {
+                @SuppressWarnings("unchecked")
+                T r = (T) result;
+                return r;
+            }
+
+            Throwable ex = firstException;
+            if (ex != null) {
+                throw new ExecutionException(ex);
+            }
+
+            throw new IllegalStateException("No completed subtasks");
         }
 
         /**
@@ -980,48 +1172,47 @@ public class StructuredTaskScope<T> implements AutoCloseable {
          *
          * <p> When no subtask completed with a result but a subtask completed with an
          * exception then the exception supplying function is invoked with the exception.
-         * If only cancelled subtasks were notified to the {@code handleComplete} method
-         * then the exception supplying function is invoked with a {@code CancellationException}.
-         *
-         * @apiNote This method is intended to be invoked by the task scope owner after it
-         * has invoked {@link #join() join} (or {@link #joinUntil(Instant) joinUntil}).
-         * A future release may add enforcement to prevent the method being called by
-         * other threads or before joining.
          *
          * @param esf the exception supplying function
          * @param <X> type of the exception to be thrown
          * @return the result of the first subtask that completed with a result
+         *
          * @throws X if no subtask completed with a result
-         * @throws IllegalStateException if the handle method was not invoked with a
-         * completed subtask
+         * @throws IllegalStateException if the handleComplete method was not invoked with a
+         * completed subtask or the task scope owner did not invoke join after forking
+         * @throws WrongThreadException if the current thread is not the task scope owner
          */
         public <X extends Throwable> T result(Function<Throwable, ? extends X> esf) throws X {
             Objects.requireNonNull(esf);
-            Future<T> f = future;
-            if (f == null) {
-                throw new IllegalStateException("No completed subtasks");
+            ensureOwnerAndJoined();
+
+            Object result = firstResult;
+            if (result == RESULT_NULL) {
+                return null;
+            } else if (result != null) {
+                @SuppressWarnings("unchecked")
+                T r = (T) result;
+                return r;
             }
-            Future.State state = f.state();
-            if (state == Future.State.SUCCESS) {
-                return f.resultNow();
-            } else {
-                Throwable throwable = (state == Future.State.FAILED)
-                        ? f.exceptionNow()
-                        : new CancellationException();
-                X ex = esf.apply(throwable);
+
+            Throwable exception = firstException;
+            if (exception != null) {
+                X ex = esf.apply(exception);
                 Objects.requireNonNull(ex, "esf returned null");
                 throw ex;
             }
+
+            throw new IllegalStateException("No completed subtasks");
         }
     }
 
     /**
      * A {@code StructuredTaskScope} that captures the exception of the first subtask to
      * complete abnormally. Once captured, it invokes the {@linkplain #shutdown() shutdown}
-     * method to interrupt unfinished threads and wakeup the owner. The policy implemented
-     * by this class is intended for cases where the results for all subtasks are required
-     * ("invoke all"); if any subtask fails then the results of other unfinished subtasks
-     * are no longer needed.
+     * method to interrupt unfinished threads and wakeup the task scope owner. The policy
+     * implemented by this class is intended for cases where the results for all subtasks
+     * are required ("invoke all"); if any subtask fails then the results of other
+     * unfinished subtasks are no longer needed.
      *
      * <p> Unless otherwise specified, passing a {@code null} argument to a method
      * in this class will cause a {@link NullPointerException} to be thrown.
@@ -1030,16 +1221,16 @@ public class StructuredTaskScope<T> implements AutoCloseable {
      */
     @PreviewFeature(feature = PreviewFeature.Feature.STRUCTURED_CONCURRENCY)
     public static final class ShutdownOnFailure extends StructuredTaskScope<Object> {
-        private static final VarHandle FUTURE;
+        private static final VarHandle FIRST_EXCEPTION;
         static {
             try {
                 MethodHandles.Lookup l = MethodHandles.lookup();
-                FUTURE = l.findVarHandle(ShutdownOnFailure.class, "future", Future.class);
+                FIRST_EXCEPTION = l.findVarHandle(ShutdownOnFailure.class, "firstException", Throwable.class);
             } catch (Exception e) {
-                throw new InternalError(e);
+                throw new ExceptionInInitializerError(e);
             }
         }
-        private volatile Future<Object> future;
+        private volatile Throwable firstException;
 
         /**
          * Constructs a new {@code ShutdownOnFailure} with the given name and thread factory.
@@ -1072,32 +1263,18 @@ public class StructuredTaskScope<T> implements AutoCloseable {
         }
 
         /**
-         * Shut down the given task scope when invoked for the first time with a {@code
-         * Future} for a task that completed abnormally (exception or cancelled).
+         * Shut down the given task scope when invoked for the first time with a task
+         * that completed abnormally.
          *
-         * @param future the completed task
-         * @see #shutdown()
-         * @see Future.State#FAILED
-         * @see Future.State#CANCELLED
+         * @throws IllegalArgumentException {@inheritDoc}
          */
         @Override
-        protected void handleComplete(Future<Object> future) {
-            Future.State state = future.state();
-            if (state == Future.State.RUNNING) {
-                throw new IllegalArgumentException("Task is not completed");
-            } else if (state == Future.State.SUCCESS) {
-                return;
-            }
-
-            // A failed task overrides a cancelled task.
-            // The first failed or cancelled task causes the scope to shutdown.
-            Future<Object> f;
-            while (((f = this.future) == null)
-                    || FUTURE_STATE_COMPARATOR.compare(f.state(), state) < 0) {
-                if (FUTURE.compareAndSet(this, f, future)) {
-                    shutdown();
-                    break;
-                }
+        protected void handleComplete(Callable<Object> task, Object result, Throwable exception) {
+            super.handleComplete(task, result, exception);
+            if (exception != null
+                    && firstException == null
+                    && FIRST_EXCEPTION.compareAndSet(this, null, exception)) {
+                shutdown();
             }
         }
 
@@ -1128,87 +1305,61 @@ public class StructuredTaskScope<T> implements AutoCloseable {
         }
 
         /**
-         * Returns the exception for the first subtask that completed with an exception.
-         * If no subtask completed with an exception but cancelled subtasks were notified
-         * to the {@code handleComplete} method then a {@code CancellationException}
-         * is returned. If no subtasks completed abnormally then an empty {@code Optional}
-         * is returned.
-         *
-         * @apiNote This method is intended to be invoked by the task scope owner after it
-         * has invoked {@link #join() join} (or {@link #joinUntil(Instant) joinUntil}).
-         * A future release may add enforcement to prevent the method being called by
-         * other threads or before joining.
+         * Returns the exception for the first subtask that completed abnormally. If no
+         * subtasks completed abnormally then an empty {@code Optional} is returned.
          *
          * @return the exception for a subtask that completed abnormally or an empty
          * optional if no subtasks completed abnormally
+         *
+         * @throws WrongThreadException if the current thread is not the task scope owner
+         * @throws IllegalStateException if the task scope owner did not invoke join after
+         * forking
          */
         public Optional<Throwable> exception() {
-            Future<Object> f = future;
-            if (f != null) {
-                Throwable throwable = (f.state() == Future.State.FAILED)
-                        ? f.exceptionNow()
-                        : new CancellationException();
-                return Optional.of(throwable);
-            } else {
-                return Optional.empty();
-            }
+            ensureOwnerAndJoined();
+            return Optional.ofNullable(firstException);
         }
 
         /**
          * Throws if a subtask completed abnormally. If any subtask completed with an
          * exception then {@code ExecutionException} is thrown with the exception of the
-         * first subtask to fail as the {@linkplain Throwable#getCause() cause}. If no
-         * subtask completed with an exception but cancelled subtasks were notified to the
-         * {@code handleComplete} method then {@code CancellationException} is thrown.
+         * first subtask to fail as the {@linkplain Throwable#getCause() cause}.
          * This method does nothing if no subtasks completed abnormally.
          *
-         * @apiNote This method is intended to be invoked by the task scope owner after it
-         * has invoked {@link #join() join} (or {@link #joinUntil(Instant) joinUntil}).
-         * A future release may add enforcement to prevent the method being called by
-         * other threads or before joining.
-         *
          * @throws ExecutionException if a subtask completed with an exception
-         * @throws CancellationException if no subtasks completed with an exception but
-         * subtasks were cancelled
+         * @throws WrongThreadException if the current thread is not the task scope owner
+         * @throws IllegalStateException if the task scope owner did not invoke join after
+         * forking
          */
         public void throwIfFailed() throws ExecutionException {
-            Future<Object> f = future;
-            if (f != null) {
-                if (f.state() == Future.State.FAILED) {
-                    throw new ExecutionException(f.exceptionNow());
-                } else {
-                    throw new CancellationException();
-                }
-            }
+            ensureOwnerAndJoined();
+            Throwable exception = firstException;
+            if (exception != null)
+                throw new ExecutionException(exception);
         }
 
         /**
          * Throws the exception produced by the given exception supplying function if
          * a subtask completed abnormally. If any subtask completed with an exception then
-         * the function is invoked with the exception of the first subtask to fail.
-         * If no subtask completed with an exception but cancelled subtasks were notified
-         * to the {@code handleComplete} method then the function is called with a {@code
-         * CancellationException}. The exception returned by the function is thrown.
+         * the function is invoked with the exception of the first subtask to fail. The
+         * exception returned by the function is thrown.
          * This method does nothing if no subtasks completed abnormally.
-         *
-         * @apiNote This method is intended to be invoked by the task scope owner after it
-         * has invoked {@link #join() join} (or {@link #joinUntil(Instant) joinUntil}).
-         * A future release may add enforcement to prevent the method being called by
-         * other threads or before joining.
          *
          * @param esf the exception supplying function
          * @param <X> type of the exception to be thrown
+         *
          * @throws X produced by the exception supplying function
+         * @throws WrongThreadException if the current thread is not the task scope owner
+         * @throws IllegalStateException if the task scope owner did not invoke join after
+         * forking
          */
         public <X extends Throwable>
         void throwIfFailed(Function<Throwable, ? extends X> esf) throws X {
+            ensureOwnerAndJoined();
             Objects.requireNonNull(esf);
-            Future<Object> f = future;
-            if (f != null) {
-                Throwable throwable = (f.state() == Future.State.FAILED)
-                        ? f.exceptionNow()
-                        : new CancellationException();
-                X ex = esf.apply(throwable);
+            Throwable exception = firstException;
+            if (exception != null) {
+                X ex = esf.apply(exception);
                 Objects.requireNonNull(ex, "esf returned null");
                 throw ex;
             }
